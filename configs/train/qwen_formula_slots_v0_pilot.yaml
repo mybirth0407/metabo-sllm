@@ -1,0 +1,67 @@
+# First official pilot of Model V0 on scaffold_sub_10.
+#
+# One setting, one seed, ten epochs. No sweep: this run exists to produce a
+# learning curve and a candidate-free validation number, not to be tuned.
+# The batch budgets are the ones already validated by the DDP smoke.
+
+name: qwen_formula_slots_v0_seed0
+
+model_config: configs/model/qwen_formula_slots_v0.yaml
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/scaffold_sub_10/fragment_supervision_v1
+  fold: train
+  valid_fold: valid          # test is never named anywhere in this pipeline
+  num_shards: 64
+  exclude_zero_target_train: true
+  max_text_length: 512
+
+batching:
+  max_spectra: 16
+  max_qwen_tokens: 4096
+  max_linked_candidates: 2048
+  bucket_multiplier: 50
+
+training:
+  precision: bf16
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  find_unused_parameters: false
+  ddp_no_sync: true
+  epochs: 10
+  max_steps: 0               # 0 = run whole epochs
+  log_every: 25
+  save_every: 0
+  seed: 0
+  output_dir: /NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/scaffold_sub_10/qwen_formula_slots_v0_seed0
+
+optimizer:
+  type: AdamW
+  fused: true
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.1
+  # total steps = epochs * optimizer steps per epoch, computed from the sampler
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+evaluation:
+  upper_limit: 1500
+  num_bins: 15000
+  min_pred_intensity: 1.0e-5
+  top_k: [20, 100]
+  presence_threshold: 0.5
+  batch_size: 32
+  # highest mean cos@100 wins; ties broken by mean cos@20
+  primary_metric: cos@100
+  tiebreak_metric: cos@20

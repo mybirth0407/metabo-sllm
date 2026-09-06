@@ -1,0 +1,58 @@
+# Infrastructure smoke for the fragment-latent trainer.
+#
+# This config is NOT a training recipe: max_steps is tiny on purpose. It exists
+# to prove the dynamic sampler, DDP, accumulation, checkpointing and resume all
+# work before any real run is started.
+
+name: qwen_formula_slots_v0_smoke
+
+# The model is defined once, in the model config; this file only adds the
+# training side, so the two cannot drift apart.
+model_config: configs/model/qwen_formula_slots_v0.yaml
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/scaffold_sub_10/fragment_supervision_v1
+  fold: train              # valid and test are never opened by this pipeline
+  num_shards: 64
+  exclude_zero_target_train: true
+  max_text_length: 512
+
+batching:
+  # Per GPU. A batch closes just before any budget would be exceeded; a
+  # spectrum that exceeds one on its own becomes a singleton batch rather than
+  # being trimmed.
+  max_spectra: 16
+  max_qwen_tokens: 4096
+  max_linked_candidates: 2048
+  bucket_multiplier: 50
+
+training:
+  precision: bf16
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  find_unused_parameters: false
+  ddp_no_sync: true
+  max_steps: 30
+  log_every: 1
+  save_every: 0
+  seed: 0
+  output_dir: runs/qwen_formula_slots_v0_smoke
+
+optimizer:
+  type: AdamW
+  fused: true
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.1
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0

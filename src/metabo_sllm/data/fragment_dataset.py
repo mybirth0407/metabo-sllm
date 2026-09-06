@@ -19,6 +19,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from metabo_sllm.chem.formula import parse_formula
+from metabo_sllm.model.input_formatter import format_row
+
 __all__ = ["FragmentSupervisionDataset", "ROW_COLUMNS"]
 
 SCHEMA_VERSION = "fragment_supervision_v1"
@@ -121,6 +124,90 @@ class FragmentSupervisionDataset:
             self.table = self.table.slice(0, limit)
 
         self._columns = {name: self.table.column(name) for name in ROW_COLUMNS}
+        self._cost_table: dict[str, np.ndarray] | None = None
+
+    def cost_table(
+        self,
+        *,
+        tokenizer=None,
+        max_text_length: int = 512,
+        slots: int = 64,
+    ) -> dict[str, np.ndarray]:
+        """Per-row scoring cost, so batches can be built by work rather than count.
+
+        Memory is driven by ``num_candidate_element_steps``, which spans two
+        orders of magnitude between spectra; a sampler counting spectra alone
+        would either starve the GPU or run it out of memory.  Everything is
+        read straight from the Arrow buffers -- no row is materialised.
+
+        ``num_tokens`` needs the tokenizer; without one it comes back as zeros
+        and the token budget is inactive.
+        """
+        if self._cost_table is not None:
+            return self._cost_table
+
+        rows = self.table.num_rows
+        rank_offsets, rank_values = self._list_column(self.table, "supervision_rank")
+        peak_offsets, _ = self._list_column(self.table, "mzs")
+        edge_offsets, edge_values = self._list_column(self.table, "edge_peak_index")
+
+        num_targets = self._target_counts(self.table, slots)
+        num_peaks = (peak_offsets[1:] - peak_offsets[:-1]).astype(np.int64)
+
+        # An edge only costs anything when the peak it points at made the cut.
+        in_top = (rank_values >= 0) & (rank_values < slots)
+        edges_per_row = (edge_offsets[1:] - edge_offsets[:-1]).astype(np.int64)
+        row_of_edge = np.repeat(np.arange(rows, dtype=np.int64), edges_per_row)
+        global_peak = rank_offsets[row_of_edge] + edge_values.astype(np.int64)
+        linked = in_top[global_peak]
+        num_linked = np.bincount(row_of_edge[linked], minlength=rows).astype(np.int64)
+
+        sizes: dict[str, int] = {}
+        num_elements = np.empty(rows, dtype=np.int64)
+        for index, formula in enumerate(self.table.column("formula").to_pylist()):
+            size = sizes.get(formula)
+            if size is None:
+                size = len(parse_formula(formula))
+                sizes[formula] = size
+            num_elements[index] = size
+
+        if tokenizer is not None:
+            encoded = tokenizer(
+                self.texts(), truncation=True, max_length=max_text_length, padding=False
+            )["input_ids"]
+            num_tokens = np.asarray([len(item) for item in encoded], dtype=np.int64)
+        else:
+            num_tokens = np.zeros(rows, dtype=np.int64)
+
+        table = {
+            "num_targets": num_targets,
+            "num_peaks": num_peaks,
+            "num_candidates_linked_to_top64": num_linked,
+            "num_elements": num_elements,
+            "num_candidate_element_steps": num_linked * num_elements,
+            "num_tokens": num_tokens,
+        }
+        if tokenizer is not None:
+            self._cost_table = table
+        return table
+
+    def texts(self) -> list[str]:
+        """The conditioning string for every row, in dataset order."""
+        columns = {
+            name: self.table.column(name).to_pylist()
+            for name in (
+                "smiles",
+                "formula",
+                "adduct",
+                "collision_energy",
+                "instrument",
+                "precursor_mz",
+            )
+        }
+        return [
+            format_row({name: values[index] for name, values in columns.items()})
+            for index in range(self.table.num_rows)
+        ]
 
     @staticmethod
     def _list_column(table: pa.Table, name: str) -> tuple[np.ndarray, np.ndarray]:
