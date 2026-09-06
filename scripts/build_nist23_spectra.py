@@ -37,6 +37,7 @@ import h5py  # noqa: E402
 import numpy as np  # noqa: E402
 import polars as pl  # noqa: E402
 import pyarrow as pa  # noqa: E402
+import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 from metabo_sllm.data.ms_parser import MsParseError, parse_ms  # noqa: E402
@@ -396,10 +397,22 @@ def verify(args: argparse.Namespace) -> int:
             problems.append(f"{fold}: expected {num_shards} shards, found {len(files)}")
         for path in files:
             shard = shard_from_filename(path.name)
-            table = pq.read_table(path)
-            if not table.schema.equals(SCHEMA, check_metadata=False):
+            if not pq.read_schema(path).equals(SCHEMA, check_metadata=False):
                 problems.append(f"{fold}/{path.name}: schema differs from {SCHEMA_VERSION}")
                 continue
+            # Only the columns the checks need; peak values stay in Arrow buffers
+            # because list lengths come from the offsets alone.
+            table = pq.read_table(
+                path,
+                columns=[
+                    "spectrum_uid",
+                    "parent_spec",
+                    "fold",
+                    "collision_index",
+                    "mzs",
+                    "intensities",
+                ],
+            )
             if table.num_rows == 0:
                 continue
 
@@ -407,8 +420,10 @@ def verify(args: argparse.Namespace) -> int:
             specs = table.column("parent_spec").to_pylist()
             indices = table.column("collision_index").to_pylist()
             folds = set(table.column("fold").to_pylist())
-            mz_lengths = np.asarray([len(v) for v in table.column("mzs").to_pylist()])
-            it_lengths = np.asarray([len(v) for v in table.column("intensities").to_pylist()])
+            mz_lengths = pc.list_value_length(table.column("mzs")).to_numpy(zero_copy_only=False)
+            it_lengths = pc.list_value_length(table.column("intensities")).to_numpy(
+                zero_copy_only=False
+            )
 
             if folds != {fold}:
                 problems.append(f"{fold}/{path.name}: fold column holds {sorted(folds)}")
