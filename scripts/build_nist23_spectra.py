@@ -42,7 +42,7 @@ import pyarrow.parquet as pq  # noqa: E402
 
 from metabo_sllm.data.ms_parser import MsParseError, parse_ms  # noqa: E402
 
-SCHEMA_VERSION = "spectra_v1"
+SCHEMA_VERSION = "spectra_v2"
 DEFAULT_NUM_SHARDS = 64
 FOLD_ORDER = ("train", "valid", "test")
 FOLD_ALIASES = {"val": "valid"}
@@ -50,24 +50,38 @@ MANIFEST_NAME = "manifest.json"
 UID_FORMAT = "{parent_spec}:{collision_index:02d}"
 SHARD_FN = "int.from_bytes(sha256(parent_spec)[:8]) % num_shards"
 
-SCHEMA = pa.schema(
-    [
-        pa.field("spectrum_uid", pa.string(), nullable=False),
-        pa.field("parent_spec", pa.string(), nullable=False),
-        pa.field("fold", pa.string(), nullable=False),
-        pa.field("collision_index", pa.int32(), nullable=False),
-        pa.field("collision_energy", pa.float64(), nullable=False),
-        pa.field("collision_energy_raw", pa.string(), nullable=False),
-        pa.field("smiles", pa.string(), nullable=False),
-        pa.field("formula", pa.string(), nullable=False),
-        pa.field("inchikey", pa.string(), nullable=False),
-        pa.field("adduct", pa.string(), nullable=False),
-        pa.field("instrument", pa.string(), nullable=False),
-        pa.field("precursor_mz", pa.float64(), nullable=False),
-        pa.field("mzs", pa.list_(pa.float64()), nullable=False),
-        pa.field("intensities", pa.list_(pa.float32()), nullable=False),
-    ]
-)
+_COMMON_FIELDS = [
+    pa.field("spectrum_uid", pa.string(), nullable=False),
+    pa.field("parent_spec", pa.string(), nullable=False),
+    pa.field("fold", pa.string(), nullable=False),
+    pa.field("collision_index", pa.int32(), nullable=False),
+    pa.field("collision_energy", pa.float64(), nullable=False),
+    pa.field("collision_energy_raw", pa.string(), nullable=False),
+    pa.field("smiles", pa.string(), nullable=False),
+    pa.field("formula", pa.string(), nullable=False),
+    pa.field("inchikey", pa.string(), nullable=False),
+    pa.field("adduct", pa.string(), nullable=False),
+    pa.field("instrument", pa.string(), nullable=False),
+    pa.field("precursor_mz", pa.float64(), nullable=False),
+    pa.field("mzs", pa.list_(pa.float64()), nullable=False),
+    pa.field("intensities", pa.list_(pa.float32()), nullable=False),
+]
+
+# v2 adds the source-text decimal places of each m/z; v1 is kept so datasets
+# already on disk stay verifiable with this script.
+SCHEMAS = {
+    "spectra_v1": pa.schema(_COMMON_FIELDS),
+    "spectra_v2": pa.schema(
+        [*_COMMON_FIELDS, pa.field("mz_decimal_places", pa.list_(pa.int8()), nullable=False)]
+    ),
+}
+SCHEMA = SCHEMAS[SCHEMA_VERSION]
+
+# Per-row list columns that must all have the same length.
+LIST_COLUMNS = {
+    "spectra_v1": ("mzs", "intensities"),
+    "spectra_v2": ("mzs", "intensities", "mz_decimal_places"),
+}
 
 # labels.tsv column -> output column
 LABEL_COLUMNS = {
@@ -285,6 +299,7 @@ def build(args: argparse.Namespace) -> int:
                                 "precursor_mz": label["precursor_mz"],
                                 "mzs": block.mzs,
                                 "intensities": block.intensities,
+                                "mz_decimal_places": block.mz_decimal_places,
                             }
                         )
 
@@ -377,6 +392,11 @@ def verify(args: argparse.Namespace) -> int:
         fail(f"manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
     num_shards = manifest["builder"]["num_shards"]
+    version = manifest["schema_version"]
+    if version not in SCHEMAS:
+        fail(f"{manifest_path}: unknown schema_version {version!r}")
+    schema = SCHEMAS[version]
+    list_columns = LIST_COLUMNS[version]
 
     problems: list[str] = []
     actual = {fold: {"parents": set(), "spectra": 0, "peaks": 0} for fold in FOLD_ORDER}
@@ -397,8 +417,8 @@ def verify(args: argparse.Namespace) -> int:
             problems.append(f"{fold}: expected {num_shards} shards, found {len(files)}")
         for path in files:
             shard = shard_from_filename(path.name)
-            if not pq.read_schema(path).equals(SCHEMA, check_metadata=False):
-                problems.append(f"{fold}/{path.name}: schema differs from {SCHEMA_VERSION}")
+            if not pq.read_schema(path).equals(schema, check_metadata=False):
+                problems.append(f"{fold}/{path.name}: schema differs from {version}")
                 continue
             # Only the columns the checks need; peak values stay in Arrow buffers
             # because list lengths come from the offsets alone.
@@ -409,8 +429,7 @@ def verify(args: argparse.Namespace) -> int:
                     "parent_spec",
                     "fold",
                     "collision_index",
-                    "mzs",
-                    "intensities",
+                    *list_columns,
                 ],
             )
             if table.num_rows == 0:
@@ -420,14 +439,17 @@ def verify(args: argparse.Namespace) -> int:
             specs = table.column("parent_spec").to_pylist()
             indices = table.column("collision_index").to_pylist()
             folds = set(table.column("fold").to_pylist())
-            mz_lengths = pc.list_value_length(table.column("mzs")).to_numpy(zero_copy_only=False)
-            it_lengths = pc.list_value_length(table.column("intensities")).to_numpy(
-                zero_copy_only=False
-            )
+            lengths = {
+                name: pc.list_value_length(table.column(name)).to_numpy(zero_copy_only=False)
+                for name in list_columns
+            }
+            mz_lengths = lengths["mzs"]
 
             if folds != {fold}:
                 problems.append(f"{fold}/{path.name}: fold column holds {sorted(folds)}")
-            length_mismatch += int(np.count_nonzero(mz_lengths != it_lengths))
+            for name, values in lengths.items():
+                if name != "mzs":
+                    length_mismatch += int(np.count_nonzero(values != mz_lengths))
 
             for uid in uids:
                 if uid in seen_uids:
@@ -464,7 +486,7 @@ def verify(args: argparse.Namespace) -> int:
     if mixed:
         problems.append(f"parents spanning several folds: {len(mixed)} (e.g. {mixed[:5]})")
     if length_mismatch:
-        problems.append(f"rows where len(mzs) != len(intensities): {length_mismatch}")
+        problems.append(f"rows where a list column disagrees in length with mzs: {length_mismatch}")
     if manifest["n_parse_failures"]:
         problems.append(f"manifest records {manifest['n_parse_failures']} parse failures")
     if shard_mismatch:

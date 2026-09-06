@@ -11,6 +11,11 @@ violates the format is reported as :class:`MsParseError` rather than silently
 repaired, so corruption is caught at build time instead of leaking into a
 training set.
 
+Alongside each m/z the parser records how many decimal places the *source text*
+carried (``mz_decimal_places``).  Converting to float loses that, yet it is the
+only evidence of how finely the instrument reported the peak, and the mass
+tolerance used downstream depends on it.
+
 Parsing happens on ``bytes``: only the collision-energy token and the peak
 tokens are decoded (as ASCII), so a header carrying non-UTF-8 compound names
 can never break a record.
@@ -21,6 +26,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 import numpy as np
 
@@ -28,6 +34,8 @@ __all__ = ["CollisionBlock", "MsParseError", "parse_ms"]
 
 _COLLISION_TAG = b">collision"
 _MAX_ENERGIES_IN_MESSAGE = 12
+# mz_decimal_places is stored as int8 downstream.
+_MAX_DECIMAL_PLACES = 127
 
 
 class MsParseError(ValueError):
@@ -38,8 +46,8 @@ class MsParseError(ValueError):
 class CollisionBlock:
     """One ``>collision`` block of a ``.ms`` record.
 
-    ``mzs`` and ``intensities`` are read-only arrays of equal length, in the
-    exact order the peaks appear in the file.
+    ``mzs``, ``intensities`` and ``mz_decimal_places`` are read-only arrays of
+    equal length, in the exact order the peaks appear in the file.
     """
 
     collision_index: int
@@ -47,6 +55,7 @@ class CollisionBlock:
     collision_energy_raw: str
     mzs: np.ndarray
     intensities: np.ndarray
+    mz_decimal_places: np.ndarray
 
     def __len__(self) -> int:
         return int(self.mzs.shape[0])
@@ -84,6 +93,7 @@ def parse_ms(
     energy = 0.0
     mzs: list[float] = []
     intensities: list[float] = []
+    decimals: list[int] = []
 
     for lineno, line in enumerate(text.split(b"\n"), start=1):
         stripped = line.strip()
@@ -103,9 +113,9 @@ def parse_ms(
             if not math.isfinite(value):
                 raise _error(source, lineno, stripped, "collision energy is not finite")
             if started:
-                blocks.append(_freeze(len(blocks), energy, energy_raw, mzs, intensities))
+                blocks.append(_freeze(len(blocks), energy, energy_raw, mzs, intensities, decimals))
             started, energy_raw, energy = True, token, value
-            mzs, intensities = [], []
+            mzs, intensities, decimals = [], [], []
             continue
 
         if not started:
@@ -119,7 +129,8 @@ def parse_ms(
                 stripped,
                 f"expected 2 whitespace-separated values, got {len(fields)}",
             )
-        mz = _to_float(_decode(fields[0], source, lineno, stripped), source, lineno, stripped, "m/z")
+        mz_token = _decode(fields[0], source, lineno, stripped)
+        mz = _to_float(mz_token, source, lineno, stripped, "m/z")
         intensity = _to_float(
             _decode(fields[1], source, lineno, stripped), source, lineno, stripped, "intensity"
         )
@@ -135,9 +146,10 @@ def parse_ms(
             )
         mzs.append(mz)
         intensities.append(intensity)
+        decimals.append(_decimal_places(mz_token, source, lineno, stripped))
 
     if started:
-        blocks.append(_freeze(len(blocks), energy, energy_raw, mzs, intensities))
+        blocks.append(_freeze(len(blocks), energy, energy_raw, mzs, intensities, decimals))
 
     if expected_energies is not None:
         found = [block.collision_energy_raw for block in blocks]
@@ -151,19 +163,45 @@ def parse_ms(
     return blocks
 
 
+def _decimal_places(token: str, source: str, lineno: int, line: bytes) -> int:
+    """Decimal places carried by the source text, from the Decimal exponent.
+
+    ``"100"`` -> 0, ``"100.1"`` -> 1, ``"100.10"`` -> 2, ``"100.1000"`` -> 4.
+    """
+    try:
+        exponent = Decimal(token).as_tuple().exponent
+    except InvalidOperation:
+        raise _error(source, lineno, line, f"m/z is not a decimal literal: {token!r}") from None
+    if not isinstance(exponent, int):  # NaN/Infinity carry a string exponent
+        raise _error(source, lineno, line, f"m/z has no decimal exponent: {token!r}")
+    places = max(0, -exponent)
+    if places > _MAX_DECIMAL_PLACES:
+        raise _error(
+            source, lineno, line, f"m/z has {places} decimal places (max {_MAX_DECIMAL_PLACES})"
+        )
+    return places
+
+
 def _freeze(
-    index: int, energy: float, energy_raw: str, mzs: list[float], intensities: list[float]
+    index: int,
+    energy: float,
+    energy_raw: str,
+    mzs: list[float],
+    intensities: list[float],
+    decimals: list[int],
 ) -> CollisionBlock:
     mz_array = np.asarray(mzs, dtype=np.float64)
     intensity_array = np.asarray(intensities, dtype=np.float32)
-    mz_array.setflags(write=False)
-    intensity_array.setflags(write=False)
+    decimal_array = np.asarray(decimals, dtype=np.int8)
+    for array in (mz_array, intensity_array, decimal_array):
+        array.setflags(write=False)
     return CollisionBlock(
         collision_index=index,
         collision_energy=energy,
         collision_energy_raw=energy_raw,
         mzs=mz_array,
         intensities=intensity_array,
+        mz_decimal_places=decimal_array,
     )
 
 

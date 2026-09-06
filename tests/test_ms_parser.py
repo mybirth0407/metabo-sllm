@@ -63,6 +63,32 @@ def test_arrays_are_read_only():
         block.mzs[0] = 0.0
     with pytest.raises(ValueError):
         block.intensities[0] = 0.0
+    with pytest.raises(ValueError):
+        block.mz_decimal_places[0] = 0
+
+
+def test_mz_decimal_places_come_from_the_source_text():
+    content = HEADER + b">collision 5\n100 1.0\n100.1 1.0\n100.10 1.0\n100.1000 1.0\n"
+    (block,) = parse_ms(content)
+
+    assert block.mz_decimal_places.dtype == np.int8
+    assert block.mz_decimal_places.tolist() == [0, 1, 2, 4]
+    # the float value cannot distinguish "100.1" from "100.1000"
+    assert block.mzs.tolist() == [100.0, 100.1, 100.1, 100.1]
+
+
+def test_list_lengths_always_agree():
+    blocks = parse_ms(TWO_BLOCKS)
+    for block in blocks:
+        assert block.mzs.shape == block.intensities.shape == block.mz_decimal_places.shape
+        assert len(block) == block.mz_decimal_places.shape[0]
+
+
+def test_empty_block_has_empty_decimal_places():
+    blocks = parse_ms(HEADER + b">collision 5\n>collision 6\n100.0 1.0\n")
+
+    assert blocks[0].mz_decimal_places.shape == (0,)
+    assert blocks[0].mz_decimal_places.dtype == np.int8
 
 
 def test_crlf_and_blank_lines_are_tolerated():
@@ -171,8 +197,10 @@ def test_real_record_matches_known_values():
     assert blocks[0].mzs[0] == pytest.approx(339.29)
     assert blocks[0].intensities[0] == pytest.approx(17.78)
     assert [b.collision_index for b in blocks] == list(range(11))
+    # "339.29" and "17.78" are printed with two decimals in this record
+    assert blocks[0].mz_decimal_places[0] == 2
     for block in blocks:
-        assert block.mzs.shape == block.intensities.shape
+        assert block.mzs.shape == block.intensities.shape == block.mz_decimal_places.shape
 
 
 @pytest.mark.skipif(
