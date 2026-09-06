@@ -32,7 +32,9 @@ __all__ = [
     "EnumerationCapExceeded",
     "FormulaError",
     "SubformulaTable",
+    "atomic_number",
     "element_mass",
+    "element_symbol",
     "formula_to_string",
     "parse_formula",
 ]
@@ -73,6 +75,22 @@ def element_mass(symbol: str) -> float:
         raise FormulaError(f"element {symbol!r} has no monoisotopic mass")
     _MASS_CACHE[symbol] = mass
     return mass
+
+
+def atomic_number(symbol: str) -> int:
+    """Atomic number of ``symbol``; formula elements are ordered by it."""
+    try:
+        return int(_PERIODIC_TABLE.GetAtomicNumber(symbol))
+    except (RuntimeError, ValueError) as exc:
+        raise FormulaError(f"unknown element {symbol!r}") from exc
+
+
+def element_symbol(number: int) -> str:
+    """Inverse of :func:`atomic_number`."""
+    try:
+        return str(_PERIODIC_TABLE.GetElementSymbol(int(number)))
+    except (RuntimeError, ValueError) as exc:
+        raise FormulaError(f"unknown atomic number {number!r}") from exc
 
 
 def parse_formula(text: str) -> dict[str, int]:

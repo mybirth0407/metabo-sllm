@@ -38,6 +38,9 @@ __all__ = [
     "DEFAULT_PPM",
     "DEPROTONATED",
     "HEAVY_SUBFORMULA_CAP",
+    "ION_STATE_TO_ID",
+    "ION_STATE_VOCABULARY",
+    "admissible_ion_state_ids",
     "IonChannel",
     "PEAK_CANDIDATE_CAP",
     "POTASSIATED",
@@ -120,6 +123,24 @@ def channels_for_adduct(adduct: str) -> tuple[IonChannel, ...]:
     if not positive and "Cl" in tokens:
         channels.append(CHLORIDE_RETAINED)
     return tuple(channels)
+
+
+# Fixed integer ids for the ion states this policy can produce.  Order is part
+# of the artifact contract: a model checkpoint's ion head is indexed by it, so
+# entries may be appended but never reordered or removed.
+ION_STATE_VOCABULARY = (
+    "protonated",
+    "deprotonated",
+    "sodiated",
+    "potassiated",
+    "chloride_retained",
+)
+ION_STATE_TO_ID = {name: index for index, name in enumerate(ION_STATE_VOCABULARY)}
+
+
+def admissible_ion_state_ids(adduct: str) -> tuple[int, ...]:
+    """Ion-state ids reachable for ``adduct`` under the candidate policy."""
+    return tuple(ION_STATE_TO_ID[channel.name] for channel in channels_for_adduct(adduct))
 
 
 def is_low_precision(decimals: int) -> bool:

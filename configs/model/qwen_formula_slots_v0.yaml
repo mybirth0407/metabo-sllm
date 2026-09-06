@@ -1,0 +1,101 @@
+# Qwen3-0.6B + LoRA -> 64 fragment slots. Graph-free: no molecular graph
+# encoder, no MAGMa labels, no hard candidate selection.
+
+name: qwen_formula_slots_v0
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/scaffold_sub_10/fragment_supervision_v1
+  fold: train          # the test fold is never opened by this config
+  max_text_length: 512
+  # A spectrum with no supervision target teaches nothing about identity or
+  # intensity and only pushes every slot towards absence. Skipped while
+  # training; the artifact still holds the row, and valid/test definitions are
+  # untouched. Set false to reproduce the earlier behaviour.
+  exclude_zero_target_train: true
+
+encoder:
+  # Local weights only. If this directory is absent the run fails; it never
+  # downloads and never falls back to a different backbone.
+  model_name_or_path: /NHNHOME/26moe001_B/BASE/models/qwen3-0.6b
+  dtype: float32
+
+lora:
+  r: 16
+  alpha: 32
+  use_rslora: true
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+slots:
+  num_slots: 64
+  hidden_dim: 512
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  # Unit scale, DETR style. Anything much smaller and the shared
+  # cross-attention read swamps the queries and all 64 slots collapse.
+  query_init_std: 1.0
+
+formula_decoder:
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 4
+  max_count: 512
+  max_elements: 32
+  element_vocabulary: atomic_numbers_1_to_118
+
+heads:
+  hidden_dim: 256
+  dropout: 0.0
+
+# Ion-state ids are fixed by metabo_sllm.chem.candidates.ION_STATE_VOCABULARY.
+# Listed here so a checkpoint's head indices stay readable; append only.
+ion_states:
+  0: protonated
+  1: deprotonated
+  2: sodiated
+  3: potassiated
+  4: chloride_retained
+
+matching:
+  intensity_weight: 0.25
+  huber_delta: 1.0
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+
+# Candidates are scored twice: once for matching without gradients, once for
+# the matched pairs with them. Neither pass drops a candidate; the chunk sizes
+# only control how much is in flight at a time.
+candidate_scoring:
+  matching_chunk_size: 64
+  matched_chunk_size: 256
+  return_full_candidate_scores: false
+
+runtime:
+  seed: 0
+
+# Evaluation binning. num_bins and ppm_tol come from the NIST23 baseline args
+# on this machine; upper_limit was not recorded there, so the 0.1 Da bin width
+# it implies is provisional.
+binning:
+  num_bins: 15000
+  upper_limit: 1500.0
+  ppm_tolerance: 20.0
+  provisional_upper_limit: true
+  source: metabo_data/results/{glacier,massformer}_nist23/scaffold_1_rnd1/args.yaml
