@@ -41,14 +41,20 @@ import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 from metabo_sllm.data.ms_parser import MsParseError, parse_ms  # noqa: E402
+from metabo_sllm.data.sharding import (  # noqa: E402
+    FOLD_ALIASES,
+    FOLD_ORDER,
+    SHARD_FN,
+    UID_FORMAT,
+    shard_filename,
+    shard_from_filename,
+    shard_of,
+    spectrum_uid,
+)
 
 SCHEMA_VERSION = "spectra_v2"
 DEFAULT_NUM_SHARDS = 64
-FOLD_ORDER = ("train", "valid", "test")
-FOLD_ALIASES = {"val": "valid"}
 MANIFEST_NAME = "manifest.json"
-UID_FORMAT = "{parent_spec}:{collision_index:02d}"
-SHARD_FN = "int.from_bytes(sha256(parent_spec)[:8]) % num_shards"
 
 _COMMON_FIELDS = [
     pa.field("spectrum_uid", pa.string(), nullable=False),
@@ -94,23 +100,6 @@ LABEL_COLUMNS = {
 
 
 # --------------------------------------------------------------------------- helpers
-
-
-def spectrum_uid(parent_spec: str, collision_index: int) -> str:
-    return UID_FORMAT.format(parent_spec=parent_spec, collision_index=collision_index)
-
-
-def shard_of(parent_spec: str, num_shards: int) -> int:
-    digest = hashlib.sha256(parent_spec.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") % num_shards
-
-
-def shard_filename(shard: int) -> str:
-    return f"part-{shard:05d}.parquet"
-
-
-def shard_from_filename(name: str) -> int:
-    return int(Path(name).stem.split("-")[1])
 
 
 def sha256_file(path: Path, chunk: int = 1 << 22) -> str:

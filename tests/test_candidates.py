@@ -13,10 +13,14 @@ from metabo_sllm.chem.candidates import (
     SODIATED,
     UnsupportedChargeError,
     channels_for_adduct,
+    decode_key,
     generate_candidates,
     is_low_precision,
+    key_components,
     mass_tolerance,
+    match_edges,
     match_spectrum,
+    theoretical_mz,
     tolerance_array,
 )
 from metabo_sllm.chem.formula import (
@@ -222,3 +226,89 @@ def test_empty_spectrum_matches_nothing():
 
     assert match.peak_candidate_counts.shape == (0,)
     assert match.unique_candidates == 0
+
+
+# --------------------------------------------------------------------------- edges
+
+SPECTRUM_MZS = np.array([60.0211, 85.0284, 100.0399, 127.0390, 145.0495, 163.0601, 181.0707])
+SPECTRUM_DECIMALS = np.array([4, 4, 4, 4, 4, 4, 4])
+
+
+def test_edge_counts_agree_with_per_peak_counts():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+H]+")
+    edges = match_edges(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+
+    per_peak = np.bincount(edges.edge_peak_index, minlength=SPECTRUM_MZS.size)
+    assert per_peak.tolist() == edges.peak_candidate_counts.tolist()
+    assert edges.edge_peak_index.shape == edges.edge_key.shape
+
+
+def test_match_spectrum_and_match_edges_agree():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+Na]+")
+    edges = match_edges(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+    match = match_spectrum(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+
+    assert match.peak_candidate_counts.tolist() == edges.peak_candidate_counts.tolist()
+    assert match.candidate_keys.tolist() == np.unique(edges.edge_key).tolist()
+
+
+def test_counts_only_mode_matches_the_full_path():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+H]+")
+    full = match_spectrum(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+    counts_only = match_spectrum(
+        table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels, collect_keys=False
+    )
+
+    assert counts_only.peak_candidate_counts.tolist() == full.peak_candidate_counts.tolist()
+    assert counts_only.unique_candidates == 0
+
+
+def test_a_candidate_shared_by_two_peaks_yields_two_edges_not_two_candidates():
+    table = table_for(GLUCOSE)
+    mz = neutral_mass({"C": 6, "H": 10, "O": 5}) + PROTONATED.mz_offset
+    edges = match_edges(table, np.array([mz, mz]), np.array([4, 4]), (PROTONATED,))
+
+    assert np.unique(edges.edge_key).size * 2 == edges.edge_key.size
+    assert edges.edge_peak_index.tolist() == sorted(edges.edge_peak_index.tolist())
+
+
+def test_theoretical_mz_matches_the_reference_implementation():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+Na]+")
+    mz = float(SPECTRUM_MZS[-1])
+    match = match_spectrum(table, np.array([mz]), np.array([4]), channels)
+
+    vectorised = theoretical_mz(table, channels, match.candidate_keys)
+    reference = [c.theoretical_mz for c in generate_candidates(table, mz, 4, channels)]
+
+    np.testing.assert_allclose(np.sort(vectorised), np.sort(reference), rtol=0, atol=1e-12)
+
+
+def test_every_edge_lies_inside_its_peak_tolerance():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+H]+")
+    edges = match_edges(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+
+    candidate_mz = theoretical_mz(table, channels, edges.edge_key)
+    observed = SPECTRUM_MZS[edges.edge_peak_index]
+    tolerance = tolerance_array(observed, SPECTRUM_DECIMALS[edges.edge_peak_index])
+
+    assert np.all(np.abs(observed - candidate_mz) <= tolerance + 1e-9)
+
+
+def test_key_components_round_trip():
+    table = table_for(GLUCOSE)
+    channels = channels_for_adduct("[M+Cl]-")
+    match = match_spectrum(table, SPECTRUM_MZS, SPECTRUM_DECIMALS, channels)
+
+    channel_index, heavy_index, hydrogen = key_components(table, match.candidate_keys)
+    for position, key in enumerate(match.candidate_keys.tolist()):
+        channel, counts, _ = decode_key(table, channels, key)
+        assert channel is channels[int(channel_index[position])]
+        assert counts.get("H", 0) == int(hydrogen[position])
+        assert table.formula_string(int(heavy_index[position]), int(hydrogen[position])) == (
+            formula_to_string(counts)
+        )

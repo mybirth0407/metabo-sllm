@@ -43,14 +43,18 @@ __all__ = [
     "POTASSIATED",
     "PROTONATED",
     "SODIATED",
+    "SpectrumEdges",
     "SpectrumMatch",
     "UnsupportedChargeError",
     "channels_for_adduct",
     "decode_key",
     "generate_candidates",
     "is_low_precision",
+    "key_components",
     "mass_tolerance",
+    "match_edges",
     "match_spectrum",
+    "theoretical_mz",
     "tolerance_array",
 ]
 
@@ -206,43 +210,47 @@ def _expand_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     return np.repeat(starts, lengths) + offsets
 
 
-def match_spectrum(
+@dataclass(frozen=True, slots=True)
+class SpectrumEdges:
+    """Every ``(peak, candidate)`` pair for one spectrum.
+
+    Attributes:
+        peak_candidate_counts: candidates found per peak, in peak order.
+        edge_peak_index: peak index of each edge.
+        edge_key: candidate key of each edge; decode with :func:`decode_key`.
+    """
+
+    peak_candidate_counts: np.ndarray
+    edge_peak_index: np.ndarray
+    edge_key: np.ndarray
+
+
+def _match_blocks(
     table: SubformulaTable,
     mzs: np.ndarray,
     decimals: np.ndarray,
     channels: tuple[IonChannel, ...],
-    *,
-    ppm: float = DEFAULT_PPM,
-    peak_cap: int = PEAK_CANDIDATE_CAP,
-    collect_keys: bool = True,
-) -> SpectrumMatch:
-    """Count and identify every subformula candidate for each peak.
+    ppm: float,
+    peak_cap: int,
+) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+    """Per-channel heavy-index ranges for every ``(peak, hydrogen count)`` cell.
 
     Hydrogen is handled analytically: for a fixed hydrogen count the admissible
     heavy mass is one contiguous interval of :attr:`SubformulaTable.heavy_masses`,
     located with two binary searches.  The empty formula is never a candidate.
 
-    Raises:
-        EnumerationCapExceeded: if any peak matches more than ``peak_cap``
-            candidates.  The search is never truncated to stay under the cap.
+    Counts are computed before any candidate is materialised so the per-peak cap
+    is checked on the true total, never on a truncated list.
     """
-    mzs = np.asarray(mzs, dtype=np.float64)
-    decimals = np.asarray(decimals, dtype=np.int64)
-    if mzs.shape != decimals.shape:
-        raise ValueError(f"mzs {mzs.shape} and decimals {decimals.shape} disagree")
-
     n_peaks = int(mzs.shape[0])
     counts = np.zeros(n_peaks, dtype=np.int64)
     if n_peaks == 0 or not channels:
-        return SpectrumMatch(counts, np.empty(0, dtype=np.int64))
+        return counts, []
 
     tolerances = tolerance_array(mzs, decimals, ppm)
     heavy = table.heavy_masses
     hydrogen_grid = np.arange(table.max_hydrogen + 1, dtype=np.float64) * _HYDROGEN_MASS
-    hydrogen_stride, channel_stride = _key_strides(table)
 
-    # First pass: bounds and counts only, so the cap is checked before any
-    # candidate list is materialised.
     blocks: list[tuple[np.ndarray, np.ndarray]] = []
     for channel in channels:
         neutral = mzs - channel.mz_offset
@@ -259,31 +267,109 @@ def match_spectrum(
         counts += length.sum(axis=1)
         blocks.append((start, length))
 
-    over = int(counts.max()) if n_peaks else 0
+    over = int(counts.max())
     if over > peak_cap:
         worst = int(np.argmax(counts))
         raise EnumerationCapExceeded(
             f"{table.formula}: peak {worst} (m/z {mzs[worst]:.4f}) matches {over:,} candidates, "
             f"over the per-peak cap of {peak_cap:,}"
         )
+    return counts, blocks
 
-    if not collect_keys:
-        return SpectrumMatch(counts, np.empty(0, dtype=np.int64))
 
-    hydrogen_index = np.tile(
-        np.arange(table.max_hydrogen + 1, dtype=np.int64), n_peaks
-    )  # matches the C-order ravel of (n_peaks, n_hydrogen)
-    chunks: list[np.ndarray] = []
+def _as_inputs(mzs: np.ndarray, decimals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mzs = np.asarray(mzs, dtype=np.float64)
+    decimals = np.asarray(decimals, dtype=np.int64)
+    if mzs.shape != decimals.shape:
+        raise ValueError(f"mzs {mzs.shape} and decimals {decimals.shape} disagree")
+    return mzs, decimals
+
+
+def match_edges(
+    table: SubformulaTable,
+    mzs: np.ndarray,
+    decimals: np.ndarray,
+    channels: tuple[IonChannel, ...],
+    *,
+    ppm: float = DEFAULT_PPM,
+    peak_cap: int = PEAK_CANDIDATE_CAP,
+) -> SpectrumEdges:
+    """Every peak-to-candidate edge, keeping the peak association.
+
+    A candidate matching several peaks yields several edges; it is not
+    duplicated by the caller.
+
+    Raises:
+        EnumerationCapExceeded: if any peak exceeds ``peak_cap``.
+    """
+    mzs, decimals = _as_inputs(mzs, decimals)
+    counts, blocks = _match_blocks(table, mzs, decimals, channels, ppm, peak_cap)
+    empty = np.empty(0, dtype=np.int64)
+    if not blocks:
+        return SpectrumEdges(counts, empty, empty)
+
+    n_peaks = int(mzs.shape[0])
+    hydrogen_stride, channel_stride = _key_strides(table)
+    n_hydrogen = table.max_hydrogen + 1
+    # Both match the C-order ravel of the (n_peaks, n_hydrogen) cell grid.
+    cell_hydrogen = np.tile(np.arange(n_hydrogen, dtype=np.int64), n_peaks)
+    cell_peak = np.repeat(np.arange(n_peaks, dtype=np.int64), n_hydrogen)
+
+    peak_chunks: list[np.ndarray] = []
+    key_chunks: list[np.ndarray] = []
     for channel_index, (start, length) in enumerate(blocks):
         flat_length = length.ravel()
         if not flat_length.any():
             continue
         heavy_indices = _expand_ranges(start.ravel(), flat_length)
-        hydrogens = np.repeat(hydrogen_index, flat_length)
-        chunks.append(heavy_indices * hydrogen_stride + hydrogens + channel_index * channel_stride)
+        hydrogens = np.repeat(cell_hydrogen, flat_length)
+        peak_chunks.append(np.repeat(cell_peak, flat_length))
+        key_chunks.append(
+            heavy_indices * hydrogen_stride + hydrogens + channel_index * channel_stride
+        )
 
-    keys = np.unique(np.concatenate(chunks)) if chunks else np.empty(0, dtype=np.int64)
-    return SpectrumMatch(counts, keys)
+    if not key_chunks:
+        return SpectrumEdges(counts, empty, empty)
+    return SpectrumEdges(counts, np.concatenate(peak_chunks), np.concatenate(key_chunks))
+
+
+def key_components(table: SubformulaTable, keys: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Split candidate keys into ``(channel index, heavy index, hydrogen count)``."""
+    hydrogen_stride, channel_stride = _key_strides(table)
+    keys = np.asarray(keys, dtype=np.int64)
+    channel_index, rest = np.divmod(keys, channel_stride)
+    heavy_index, hydrogen = np.divmod(rest, hydrogen_stride)
+    return channel_index, heavy_index, hydrogen
+
+
+def theoretical_mz(
+    table: SubformulaTable, channels: tuple[IonChannel, ...], keys: np.ndarray
+) -> np.ndarray:
+    """Theoretical m/z of each candidate key, vectorised."""
+    channel_index, heavy_index, hydrogen = key_components(table, keys)
+    offsets = np.asarray([channel.mz_offset for channel in channels], dtype=np.float64)
+    neutral = table.heavy_masses[heavy_index] + hydrogen * _HYDROGEN_MASS
+    return neutral + offsets[channel_index]
+
+
+def match_spectrum(
+    table: SubformulaTable,
+    mzs: np.ndarray,
+    decimals: np.ndarray,
+    channels: tuple[IonChannel, ...],
+    *,
+    ppm: float = DEFAULT_PPM,
+    peak_cap: int = PEAK_CANDIDATE_CAP,
+    collect_keys: bool = True,
+) -> SpectrumMatch:
+    """Count candidates per peak and list the spectrum's distinct candidates."""
+    if not collect_keys:
+        mzs, decimals = _as_inputs(mzs, decimals)
+        counts, _ = _match_blocks(table, mzs, decimals, channels, ppm, peak_cap)
+        return SpectrumMatch(counts, np.empty(0, dtype=np.int64))
+
+    edges = match_edges(table, mzs, decimals, channels, ppm=ppm, peak_cap=peak_cap)
+    return SpectrumMatch(edges.peak_candidate_counts, np.unique(edges.edge_key))
 
 
 def generate_candidates(

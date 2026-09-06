@@ -145,6 +145,7 @@ class SubformulaTable:
         "max_hydrogen",
         "_order",
         "_radix",
+        "_string_cache",
     )
 
     def __init__(self, precursor: dict[str, int], *, heavy_cap: int) -> None:
@@ -179,6 +180,9 @@ class SubformulaTable:
         self.heavy_masses.setflags(write=False)
         self._order = order.astype(np.int64, copy=False)
         self._radix = tuple(count + 1 for count in self.heavy_counts)
+        # Collision-energy siblings of one molecule hit the same subformulas
+        # repeatedly, so rendering each formula string once pays for itself.
+        self._string_cache: dict[tuple[int, int], str] = {}
 
     @property
     def total_size(self) -> int:
@@ -200,6 +204,15 @@ class SubformulaTable:
             if remainder:
                 counts[symbol] = remainder
         return dict(reversed(list(counts.items())))
+
+    def formula_string(self, heavy_index: int, hydrogen: int) -> str:
+        """Hill-notation formula for ``(heavy_index, hydrogen)``, memoised."""
+        cache_key = (int(heavy_index), int(hydrogen))
+        cached = self._string_cache.get(cache_key)
+        if cached is None:
+            cached = formula_to_string(self.decode(*cache_key))
+            self._string_cache[cache_key] = cached
+        return cached
 
     def mass(self, heavy_index: int, hydrogen: int) -> float:
         """Monoisotopic mass of the subformula at ``(heavy_index, hydrogen)``."""
