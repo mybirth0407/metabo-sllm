@@ -28,6 +28,8 @@ The test fold is never read.
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
 import os
@@ -245,6 +247,20 @@ class Diagnostics:
         self.energy_top64 = 0.0
         self.zero_energy_spectra = 0
 
+    def merge(self, other: "Diagnostics") -> None:
+        """Fold one shard's counts into this fold's. Lists join, counters add.
+
+        Every attribute is either a list of per-spectrum values or a running
+        total, so shards can be accumulated in any order and the result is the
+        same as having walked them one after another.
+        """
+        for name, value in vars(other).items():
+            current = getattr(self, name)
+            if isinstance(current, list):
+                current.extend(value)
+            else:
+                setattr(self, name, current + value)
+
     def add(
         self,
         counts: np.ndarray,
@@ -437,6 +453,104 @@ def _build_row(
     )
 
 
+def _shard_rows(source_path: Path, args: argparse.Namespace, budget: int | None):
+    """Every supervision row in one source shard, with its own diagnostics.
+
+    A shard is self-contained: shard assignment hashes ``parent_spec``, so a
+    molecule's collision-energy siblings all land here together and the
+    subformula cache stays warm without being shared with anyone else. That is
+    what lets shards be built in separate processes.
+    """
+    cache = TableCache()
+    diagnostics = Diagnostics()
+    rows: list[dict] = []
+    totals = {
+        "spectra": 0,
+        "peaks": 0,
+        "candidates": 0,
+        "edges": 0,
+        "parents": set(),
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
+    if budget is not None and budget <= 0:
+        return rows, diagnostics, totals
+
+    source = pq.read_table(source_path, columns=SOURCE_COLUMNS)
+    if source.num_rows:
+        columns = {
+            name: source.column(name).to_pylist()
+            for name in SOURCE_COLUMNS
+            if name not in ("mzs", "intensities", "mz_decimal_places")
+        }
+        mz_offsets, mz_values = _list_column(source, "mzs")
+        in_offsets, in_values = _list_column(source, "intensities")
+        dp_offsets, dp_values = _list_column(source, "mz_decimal_places")
+
+        for row in range(source.num_rows):
+            if budget is not None and totals["spectra"] >= budget:
+                break
+            mzs = mz_values[mz_offsets[row] : mz_offsets[row + 1]]
+            intensities = in_values[in_offsets[row] : in_offsets[row + 1]]
+            decimals = dp_values[dp_offsets[row] : dp_offsets[row + 1]]
+            uid = columns["spectrum_uid"][row]
+
+            try:
+                subformulas = cache.get(columns["formula"][row], heavy_cap=args.heavy_cap)
+                channels = channels_for_adduct(columns["adduct"][row])
+            except (FormulaError, UnsupportedChargeError, EnumerationCapExceeded) as exc:
+                fail(f"{uid}: {exc}")
+
+            try:
+                record, counts, mask, rank, n_candidates, edge_index = _build_row(
+                    row, columns, subformulas, channels, mzs, intensities, decimals, args
+                )
+            except EnumerationCapExceeded as exc:
+                fail(f"{uid}: {exc}")
+
+            rows.append(record)
+            diagnostics.add(
+                counts, decimals, intensities, mask, rank, n_candidates, edge_index
+            )
+            totals["spectra"] += 1
+            totals["peaks"] += int(mzs.shape[0])
+            totals["candidates"] += n_candidates
+            totals["edges"] += int(edge_index.size)
+            totals["parents"].add(columns["parent_spec"][row])
+
+    # Reported per shard rather than globally: each worker keeps its own cache,
+    # and a shard holds all of a molecule's collision-energy siblings, so this
+    # still measures the reuse that matters.
+    totals["cache_hits"] = cache.hits
+    totals["cache_misses"] = cache.misses
+    return rows, diagnostics, totals
+
+
+def _build_shard(payload, budget: int | None = None):
+    """Build one shard and write it. Runs in the parent or in a worker."""
+    source_path, out_path, fold, shard, args = payload
+    try:
+        rows, diagnostics, totals = _shard_rows(Path(source_path), args, budget)
+    except SystemExit as exc:  # ``fail`` inside a worker must reach the parent
+        raise RuntimeError(f"{fold}/{shard_filename(shard)}: {exc}") from exc
+
+    out_table = (
+        pa.table({name: [r[name] for r in rows] for name in SCHEMA.names}, schema=SCHEMA)
+        if rows
+        else SCHEMA.empty_table()
+    )
+    pq.write_table(out_table, Path(out_path), compression="zstd")
+    shard_stat = {
+        "shard": shard,
+        "path": f"{fold}/{shard_filename(shard)}",
+        "rows": len(rows),
+        "peaks": int(sum(len(r["mzs"]) for r in rows)),
+        "candidates": int(sum(len(r["candidate_ion_state"]) for r in rows)),
+        "edges": int(sum(len(r["edge_peak_index"]) for r in rows)),
+    }
+    return shard_stat, diagnostics, totals
+
+
 def build(args: argparse.Namespace) -> int:
     spectra_dir = Path(args.spectra).resolve()
     out_dir = Path(args.out).resolve()
@@ -466,8 +580,13 @@ def build(args: argparse.Namespace) -> int:
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
-    cache = TableCache()
+    # ``func`` is argparse's subcommand callback; nothing downstream needs it
+    # and it only complicates pickling the namespace out to a worker.
+    worker_args = argparse.Namespace(
+        **{key: value for key, value in vars(args).items() if key != "func"}
+    )
     diagnostics = {fold: Diagnostics() for fold in BUILD_FOLDS}
+    cache_stats = {"hits": 0, "misses": 0}
     fold_stats = {}
     shard_stats: dict[str, list[dict]] = {}
     started = time.perf_counter()
@@ -479,83 +598,57 @@ def build(args: argparse.Namespace) -> int:
         (tmp_dir / fold).mkdir()
         budget = limits.get(fold)
         seen = 0
-        stats = {"spectra": 0, "peaks": 0, "candidates": 0, "edges": 0, "parents": set()}
+        stats = {
+            "spectra": 0,
+            "peaks": 0,
+            "candidates": 0,
+            "edges": 0,
+            "parents": set(),
+        }
         shard_stats[fold] = []
 
+        payloads = []
         for shard in range(num_shards):
             source_path = source_fold / shard_filename(shard)
             if not source_path.is_file():
                 fail(f"source shard missing: {source_path}")
-            rows: list[dict] = []
-            if budget is None or seen < budget:
-                source = pq.read_table(source_path, columns=SOURCE_COLUMNS)
-                if source.num_rows:
-                    columns = {
-                        name: source.column(name).to_pylist()
-                        for name in SOURCE_COLUMNS
-                        if name not in ("mzs", "intensities", "mz_decimal_places")
-                    }
-                    mz_offsets, mz_values = _list_column(source, "mzs")
-                    in_offsets, in_values = _list_column(source, "intensities")
-                    dp_offsets, dp_values = _list_column(source, "mz_decimal_places")
-
-                    for row in range(source.num_rows):
-                        if budget is not None and seen >= budget:
-                            break
-                        mzs = mz_values[mz_offsets[row] : mz_offsets[row + 1]]
-                        intensities = in_values[in_offsets[row] : in_offsets[row + 1]]
-                        decimals = dp_values[dp_offsets[row] : dp_offsets[row + 1]]
-                        uid = columns["spectrum_uid"][row]
-
-                        try:
-                            subformulas = cache.get(
-                                columns["formula"][row], heavy_cap=args.heavy_cap
-                            )
-                            channels = channels_for_adduct(columns["adduct"][row])
-                        except (FormulaError, UnsupportedChargeError, EnumerationCapExceeded) as exc:
-                            fail(f"{uid}: {exc}")
-
-                        try:
-                            record, counts, mask, rank, n_candidates, edge_index = _build_row(
-                                row,
-                                columns,
-                                subformulas,
-                                channels,
-                                mzs,
-                                intensities,
-                                decimals,
-                                args,
-                            )
-                        except EnumerationCapExceeded as exc:
-                            fail(f"{uid}: {exc}")
-
-                        rows.append(record)
-                        diagnostics[fold].add(
-                            counts, decimals, intensities, mask, rank, n_candidates, edge_index
-                        )
-                        stats["spectra"] += 1
-                        stats["peaks"] += int(mzs.shape[0])
-                        stats["candidates"] += n_candidates
-                        stats["edges"] += int(edge_index.size)
-                        stats["parents"].add(columns["parent_spec"][row])
-                        seen += 1
-
-            out_table = (
-                pa.table({name: [r[name] for r in rows] for name in SCHEMA.names}, schema=SCHEMA)
-                if rows
-                else SCHEMA.empty_table()
+            payloads.append(
+                (
+                    str(source_path),
+                    str(tmp_dir / fold / shard_filename(shard)),
+                    fold,
+                    shard,
+                    worker_args,
+                )
             )
-            pq.write_table(out_table, tmp_dir / fold / shard_filename(shard), compression="zstd")
-            shard_stats[fold].append(
-                {
-                    "shard": shard,
-                    "path": f"{fold}/{shard_filename(shard)}",
-                    "rows": len(rows),
-                    "peaks": int(sum(len(r["mzs"]) for r in rows)),
-                    "candidates": int(sum(len(r["candidate_ion_state"]) for r in rows)),
-                    "edges": int(sum(len(r["edge_peak_index"]) for r in rows)),
-                }
-            )
+
+        # Shards are independent, so they go out to processes. A capped build
+        # (--limit-spectra) cannot: its budget is consumed shard by shard, and
+        # which rows land in the output would depend on who finished first.
+        if budget is None and args.workers > 1:
+            context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=min(args.workers, len(payloads)), mp_context=context
+            ) as pool:
+                results = list(pool.map(_build_shard, payloads))
+        else:
+            results = []
+            for payload in payloads:
+                remaining = None if budget is None else max(budget - seen, 0)
+                result = _build_shard(payload, budget=remaining)
+                seen += result[2]["spectra"]
+                results.append(result)
+
+        for shard_stat, shard_diagnostics, totals in results:
+            shard_stats[fold].append(shard_stat)
+            diagnostics[fold].merge(shard_diagnostics)
+            stats["spectra"] += totals["spectra"]
+            stats["peaks"] += totals["peaks"]
+            stats["candidates"] += totals["candidates"]
+            stats["edges"] += totals["edges"]
+            stats["parents"].update(totals["parents"])
+            cache_stats["hits"] += totals["cache_hits"]
+            cache_stats["misses"] += totals["cache_misses"]
 
         stats["parents"] = len(stats["parents"])
         fold_stats[fold] = stats
@@ -585,6 +678,7 @@ def build(args: argparse.Namespace) -> int:
             "uid_format": UID_FORMAT,
             "shard_fn": SHARD_FN,
             "limit_spectra": args.limit_spectra,
+            "workers": args.workers,
             "candidate_order": "ascending candidate key (ion channel, heavy mass index, hydrogen)",
         },
         "inputs": {
@@ -654,7 +748,7 @@ def build(args: argparse.Namespace) -> int:
             "elapsed_seconds": round(elapsed, 3),
             "spectra_per_second": round(total_spectra / elapsed, 1) if elapsed else None,
             "peaks_per_second": round(total_peaks / elapsed, 1) if elapsed else None,
-            "subformula_cache": {"hits": cache.hits, "misses": cache.misses},
+            "subformula_cache": {"hits": cache_stats["hits"], "misses": cache_stats["misses"]},
         },
         "enumeration_cap_hits": 0,
         "overflow": 0,
@@ -913,6 +1007,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="total spectra, split evenly between train and valid (smoke runs)",
+    )
+    builder.add_argument(
+        "--workers",
+        type=int,
+        default=24,
+        help="processes to build shards with; 1 forces the serial path",
     )
     builder.add_argument("--overwrite", action="store_true")
     builder.set_defaults(func=build)

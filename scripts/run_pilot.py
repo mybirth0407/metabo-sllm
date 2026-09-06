@@ -319,7 +319,8 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.perf_counter() - started
     final = {
         **manifest,
-        "baseline_cos@100": baseline["cos@100"]["mean"],
+        "baseline_cos@100": baseline[PRIMARY_SPACE]["cos@100"]["mean"],
+        "baseline_cos@100_legacy_raw": baseline["legacy_raw"]["cos@100"]["mean"],
         "best": best,
         "elapsed_seconds": round(elapsed, 1),
         "peak_gpu_memory_gib_per_rank": [

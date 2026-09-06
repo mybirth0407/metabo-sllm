@@ -1,0 +1,120 @@
+# Qwen3-0.6B-Base + LoRA -> 64 fragment slots. Graph-free: no molecular graph
+# encoder, no MAGMa labels, no hard candidate selection.
+#
+# V1 differs from V0 in two ways, both aimed at the underfitting the evaluation
+# contract audit found: the backbone is the Base checkpoint rather than the
+# post-trained one, and every adapted or trained component is larger.
+#
+# On the backbone: the language model is used only as an encoder of a fixed
+# template string, never as a generator, and the chat template is not used at
+# all. Post-training reshapes representations for dialogue and instruction
+# following, which this use has no need of, so the Base checkpoint is the more
+# appropriate starting point for a frozen feature extractor.
+
+name: qwen_formula_slots_v1
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/scaffold_sub_10/fragment_supervision_v1
+  fold: train          # the test fold is never opened by this config
+  max_text_length: 512
+  # A spectrum with no supervision target teaches nothing about identity or
+  # intensity and only pushes every slot towards absence. Skipped while
+  # training; the artifact still holds the row, and valid/test definitions are
+  # untouched. Set false to reproduce the earlier behaviour.
+  exclude_zero_target_train: true
+
+encoder:
+  # Local weights only. If this directory is absent the run fails; it never
+  # downloads and never falls back to a different backbone.
+  # Provisioned at revision da87bfb608c14b7cf20ba1ce41287e8de496c0cd; every
+  # file's SHA-256 is in models/model_manifest_qwen3-0.6b-base.json.
+  model_name_or_path: /NHNHOME/26moe001_B/BASE/models/qwen3-0.6b-base
+  # fp32 master weights; the compute runs under bf16 autocast.
+  dtype: float32
+
+lora:
+  # r 16 -> 64. The backbone stays frozen, so this and the slot stack are where
+  # the model's capacity to fit the task actually lives.
+  r: 64
+  alpha: 128
+  use_rslora: true
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+slots:
+  num_slots: 64
+  hidden_dim: 768
+  num_layers: 6
+  num_heads: 12
+  dropout: 0.1
+  # Unit scale, DETR style. Anything much smaller and the shared
+  # cross-attention read swamps the queries and all 64 slots collapse.
+  query_init_std: 1.0
+
+formula_decoder:
+  hidden_dim: 512
+  num_layers: 3
+  num_heads: 8
+  max_count: 512
+  max_elements: 32
+  element_vocabulary: atomic_numbers_1_to_118
+  # Must stay 0.0: the two-pass scorer evaluates candidates once for matching
+  # and once for the matched pairs, and any dropout here would make the
+  # assignment and the loss disagree.
+  dropout: 0.0
+
+heads:
+  hidden_dim: 512
+  dropout: 0.0
+
+# Ion-state ids are fixed by metabo_sllm.chem.candidates.ION_STATE_VOCABULARY.
+# Listed here so a checkpoint's head indices stay readable; append only.
+ion_states:
+  0: protonated
+  1: deprotonated
+  2: sodiated
+  3: potassiated
+  4: chloride_retained
+
+matching:
+  intensity_weight: 0.25
+  huber_delta: 1.0
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+optim:
+  lr: 1.5e-4
+  weight_decay: 0.0
+  grad_clip: 5.0
+
+# Candidates are scored twice: once for matching without gradients, once for
+# the matched pairs with them. Neither pass drops a candidate; the chunk sizes
+# only control how much is in flight at a time. Raised with the batch budget.
+candidate_scoring:
+  matching_chunk_size: 128
+  matched_chunk_size: 512
+  return_full_candidate_scores: false
+
+runtime:
+  seed: 0
+
+# Evaluation binning. num_bins and ppm_tol come from the NIST23 baseline args
+# on this machine; upper_limit was not recorded there, so the 0.1 Da bin width
+# it implies is provisional.
+binning:
+  num_bins: 15000
+  upper_limit: 1500.0
+  ppm_tolerance: 20.0
+  provisional_upper_limit: true
+  source: metabo_data/results/{glacier,massformer}_nist23/scaffold_1_rnd1/args.yaml

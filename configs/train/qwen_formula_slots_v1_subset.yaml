@@ -1,0 +1,87 @@
+# The long subset run: how far this configuration converges on scaffold_sub_10
+# before the full split is spent on it.
+#
+# The evaluation contract audit found the pilot underfitting -- 0.0502 bag mass
+# and 40.7 % argmax-in-bag on *training* data after 10 epochs -- so this run
+# raises budget and capacity together rather than isolating either. The pilot
+# used 9 % of the available GPU memory and finished in 39 minutes; there was
+# nothing to be gained by leaving that idle.
+#
+# Changes from the pilot, all in one run by design:
+#   backbone      post-trained Qwen3-0.6B -> Qwen3-0.6B-Base
+#   LoRA rank     16 -> 64
+#   slot stack    512x4 -> 768x6;  formula decoder 256x2 -> 512x3
+#   batch         16 -> 64 spectra per GPU
+#   accumulation  2 -> 1, so the 4x larger batch buys optimizer steps rather
+#                 than only a larger effective batch (128 -> 256 spectra)
+#   epochs        10 -> 32. The larger model runs at ~220 spectra/s against the
+#                 pilot's 415, so 32 epochs is about 4 hours.
+#   lr            1.0e-4 -> 1.5e-4, roughly sqrt-scaled with the effective batch
+#   grad clip     1.0 -> 5.0. At 1.0 every one of the pilot's 283 logged steps
+#                 clipped, median coefficient 0.244, so the threshold was acting
+#                 as a second learning-rate schedule instead of a spike guard.
+
+name: qwen_formula_slots_v1_base_seed0
+
+model_config: configs/model/qwen_formula_slots_v1.yaml
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/scaffold_sub_10/fragment_supervision_v1
+  fold: train
+  valid_fold: valid          # test is never named anywhere in this pipeline
+  num_shards: 64
+  exclude_zero_target_train: true
+  max_text_length: 512
+
+batching:
+  max_spectra: 64
+  max_qwen_tokens: 16384
+  max_linked_candidates: 8192
+  bucket_multiplier: 50
+
+training:
+  precision: bf16
+  gradient_accumulation_steps: 1
+  max_grad_norm: 5.0
+  find_unused_parameters: false
+  ddp_no_sync: true
+  epochs: 32
+  max_steps: 0               # 0 = run whole epochs
+  log_every: 50
+  save_every: 0
+  seed: 0
+  output_dir: /NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/scaffold_sub_10/qwen_formula_slots_v1_base_seed0
+
+optimizer:
+  type: AdamW
+  fused: true
+  learning_rate: 1.5e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.03
+  # Annealed further than the pilot's 0.1: a hundred epochs has room for a
+  # long low-rate tail, and the pilot never reached one.
+  min_lr_ratio: 0.05
+  # total steps = epochs * optimizer steps per epoch, computed from the sampler
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+evaluation:
+  upper_limit: 1500
+  num_bins: 15000
+  min_pred_intensity: 1.0e-5
+  top_k: [20, 100]
+  presence_threshold: 0.5
+  batch_size: 64
+  # Selection runs on canonical_sqrt, the space the intensity head is trained
+  # in; legacy_raw is recorded beside it but never picks the winner.
+  primary_metric: cos@100
+  tiebreak_metric: cos@20
