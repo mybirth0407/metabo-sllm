@@ -17,12 +17,15 @@ from dataclasses import dataclass
 import numpy as np
 
 __all__ = [
+    "EVALUATION_SPACES",
+    "PRIMARY_SPACE",
     "BinningConfig",
     "SpectrumScore",
     "bin_experimental",
     "bin_index",
     "bin_prediction",
     "cosine_at_k",
+    "observation_in_space",
     "score_prediction",
     "summarise_scores",
 ]
@@ -41,6 +44,28 @@ class BinningConfig:
     num_bins: int = 15000
     min_pred_intensity: float = 1.0e-5
     top_k: tuple[int, ...] = (20, 100)
+
+
+# The intensity head is trained against ``sqrt(y)/||sqrt(y)||`` over the whole
+# spectrum, so its output is a square-root-space quantity.  ``canonical_sqrt``
+# is therefore the space where prediction and observation actually match, and
+# it is ms-pred's own contract: the square root is applied once, at
+# preprocessing (``common/misc_utils.py``), and never again at evaluation.
+# ``legacy_raw`` is what this project reported before that was pinned down -- a
+# square-root prediction against a raw observation.  It is kept and reported
+# alongside so older runs stay comparable, not because it measures the model.
+PRIMARY_SPACE = "canonical_sqrt"
+EVALUATION_SPACES = (PRIMARY_SPACE, "legacy_raw")
+
+
+def observation_in_space(intensity: np.ndarray, space: str) -> np.ndarray:
+    """Bring the observation into ``space``. The prediction is never touched."""
+    intensity = np.clip(np.asarray(intensity, dtype=np.float64), 0.0, None)
+    if space == "canonical_sqrt":
+        return np.sqrt(intensity)
+    if space == "legacy_raw":
+        return intensity
+    raise ValueError(f"unknown intensity space {space!r}")
 
 
 def bin_index(mz: np.ndarray, config: BinningConfig | None = None) -> np.ndarray:
@@ -113,7 +138,9 @@ def cosine_at_k(prediction: np.ndarray, experimental: np.ndarray, k: int) -> flo
 @dataclass
 class SpectrumScore:
     spectrum_uid: str
-    cosine: dict[int, float]
+    # space -> k -> value.  Nested by space so that no reader can pick up a
+    # cosine without saying which space it belongs to.
+    cosine: dict[str, dict[int, float]]
     predicted_peaks: int
     predicted_bins: int
     duplicate_bin_collisions: int
@@ -129,17 +156,24 @@ def score_prediction(
     experimental_intensity: np.ndarray,
     config: BinningConfig | None = None,
 ) -> SpectrumScore:
-    """``cos@K`` for every configured ``K``, plus what the prediction looked like."""
+    """``cos@K`` in every evaluation space, plus what the prediction looked like."""
     config = config or BinningConfig()
     predicted_bins, dropped = bin_prediction(predicted_mz, predicted_intensity, config)
-    experimental_bins = bin_experimental(experimental_mz, experimental_intensity, config)
+    cosine = {}
+    for space in EVALUATION_SPACES:
+        experimental_bins = bin_experimental(
+            experimental_mz, observation_in_space(experimental_intensity, space), config
+        )
+        cosine[space] = {
+            k: cosine_at_k(predicted_bins, experimental_bins, k) for k in config.top_k
+        }
 
     occupied = int(np.count_nonzero(predicted_bins))
     index = bin_index(np.asarray(predicted_mz, dtype=np.float64), config)
     inside = int(_in_range(index, config).sum()) if index.size else 0
     return SpectrumScore(
         spectrum_uid=spectrum_uid,
-        cosine={k: cosine_at_k(predicted_bins, experimental_bins, k) for k in config.top_k},
+        cosine=cosine,
         predicted_peaks=int(np.asarray(predicted_mz).size),
         predicted_bins=occupied,
         duplicate_bin_collisions=max(0, inside - occupied),
@@ -154,15 +188,21 @@ def summarise_scores(scores: list[SpectrumScore], config: BinningConfig | None =
     if not scores:
         return {"spectra": 0}
 
-    summary: dict = {"spectra": len(scores)}
-    for k in config.top_k:
-        values = np.asarray([score.cosine[k] for score in scores], dtype=np.float64)
-        summary[f"cos@{k}"] = {
-            "mean": float(values.mean()),
-            "median": float(np.percentile(values, 50)),
-            "p10": float(np.percentile(values, 10)),
-            "p90": float(np.percentile(values, 90)),
-        }
+    # Each space gets its own block, and there is no bare ``cos@K`` key: a run
+    # written before the spaces were separated is then trivially distinguishable
+    # from one written after, rather than silently changing meaning.
+    summary: dict = {"spectra": len(scores), "primary_space": PRIMARY_SPACE}
+    for space in EVALUATION_SPACES:
+        block = {}
+        for k in config.top_k:
+            values = np.asarray([score.cosine[space][k] for score in scores], dtype=np.float64)
+            block[f"cos@{k}"] = {
+                "mean": float(values.mean()),
+                "median": float(np.percentile(values, 50)),
+                "p10": float(np.percentile(values, 10)),
+                "p90": float(np.percentile(values, 90)),
+            }
+        summary[space] = block
     peaks = np.asarray([score.predicted_peaks for score in scores], dtype=np.float64)
     bins = np.asarray([score.predicted_bins for score in scores], dtype=np.float64)
     collisions = np.asarray([score.duplicate_bin_collisions for score in scores])

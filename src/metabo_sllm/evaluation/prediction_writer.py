@@ -13,6 +13,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from metabo_sllm.evaluation.spectrum_metrics import EVALUATION_SPACES
+
 __all__ = ["PREDICTION_SCHEMA", "write_predictions"]
 
 PREDICTION_SCHEMA = pa.schema(
@@ -25,8 +27,12 @@ PREDICTION_SCHEMA = pa.schema(
         pa.field("predicted_intensities", pa.list_(pa.float64()), nullable=False),
         pa.field("predicted_presence", pa.list_(pa.float64()), nullable=False),
         pa.field("predicted_slot_index", pa.list_(pa.int32()), nullable=False),
-        pa.field("cos_at_20", pa.float64(), nullable=False),
-        pa.field("cos_at_100", pa.float64(), nullable=False),
+        # Named by space, because a bare ``cos_at_100`` does not say what it
+        # was measured against.
+        pa.field("cos_at_20_canonical_sqrt", pa.float64(), nullable=False),
+        pa.field("cos_at_100_canonical_sqrt", pa.float64(), nullable=False),
+        pa.field("cos_at_20_legacy_raw", pa.float64(), nullable=False),
+        pa.field("cos_at_100_legacy_raw", pa.float64(), nullable=False),
         pa.field("active_slots", pa.int32(), nullable=False),
         pa.field("zero_prediction", pa.bool_(), nullable=False),
     ]
@@ -59,8 +65,11 @@ def write_predictions(
         )
         rows["predicted_presence"].append([f.presence for f in prediction.fragments])
         rows["predicted_slot_index"].append([f.slot_index for f in prediction.fragments])
-        rows["cos_at_20"].append(float(score.cosine[20]) if score else 0.0)
-        rows["cos_at_100"].append(float(score.cosine[100]) if score else 0.0)
+        for space in EVALUATION_SPACES:
+            for k in (20, 100):
+                rows[f"cos_at_{k}_{space}"].append(
+                    float(score.cosine[space][k]) if score else 0.0
+                )
         rows["active_slots"].append(int(prediction.active_slots))
         rows["zero_prediction"].append(bool(score.zero_prediction) if score else True)
 

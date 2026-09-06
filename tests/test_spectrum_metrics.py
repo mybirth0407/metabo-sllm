@@ -8,11 +8,14 @@ import numpy as np
 import pytest
 
 from metabo_sllm.evaluation.spectrum_metrics import (
+    EVALUATION_SPACES,
+    PRIMARY_SPACE,
     BinningConfig,
     bin_experimental,
     bin_index,
     bin_prediction,
     cosine_at_k,
+    observation_in_space,
     score_prediction,
     summarise_scores,
 )
@@ -139,15 +142,38 @@ def test_zero_experimental_scores_zero():
 # --------------------------------------------------------------------- score
 
 
-def test_perfect_prediction_scores_one_on_both_ks():
-    mz = np.array([100.0, 200.0, 300.0])
-    intensity = np.array([1.0, 0.5, 0.25])
-    score = score_prediction("uid", mz, intensity, mz, intensity)
+MZ = np.array([100.0, 200.0, 300.0])
+OBSERVED = np.array([1.0, 0.5, 0.25])
 
-    assert score.cosine[20] == pytest.approx(1.0)
-    assert score.cosine[100] == pytest.approx(1.0)
+
+def test_both_spaces_are_always_reported():
+    score = score_prediction("uid", MZ, OBSERVED, MZ, OBSERVED)
+
+    assert set(score.cosine) == set(EVALUATION_SPACES)
+
+
+def test_an_unnamed_space_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError, match="unknown intensity space"):
+        observation_in_space(OBSERVED, "sqrt")
+
+
+def test_a_square_root_prediction_scores_one_in_the_primary_space():
+    """The intensity head emits sqrt(y); that is where a perfect model is perfect."""
+    score = score_prediction("uid", MZ, np.sqrt(OBSERVED), MZ, OBSERVED)
+
+    assert score.cosine[PRIMARY_SPACE][20] == pytest.approx(1.0)
+    assert score.cosine[PRIMARY_SPACE][100] == pytest.approx(1.0)
+    assert score.cosine["legacy_raw"][100] < 1.0
     assert not score.zero_prediction
     assert score.out_of_range == 0
+
+
+def test_a_raw_prediction_scores_one_only_in_the_legacy_space():
+    """And the mirror image, so neither space can silently stand for the other."""
+    score = score_prediction("uid", MZ, OBSERVED, MZ, OBSERVED)
+
+    assert score.cosine["legacy_raw"][100] == pytest.approx(1.0)
+    assert score.cosine[PRIMARY_SPACE][100] < 1.0
 
 
 def test_duplicate_bins_are_counted():
@@ -167,7 +193,7 @@ def test_empty_prediction_is_flagged_not_crashed():
     )
 
     assert score.zero_prediction
-    assert score.cosine[100] == 0.0
+    assert all(score.cosine[space][100] == 0.0 for space in EVALUATION_SPACES)
 
 
 def test_summary_reports_the_distribution():
@@ -178,8 +204,13 @@ def test_summary_reports_the_distribution():
     summary = summarise_scores([good, bad])
 
     assert summary["spectra"] == 2
-    assert summary["cos@100"]["mean"] == pytest.approx(0.5)
-    assert set(summary["cos@100"]) == {"mean", "median", "p10", "p90"}
+    assert summary["primary_space"] == PRIMARY_SPACE
+    for space in EVALUATION_SPACES:
+        assert summary[space]["cos@100"]["mean"] == pytest.approx(0.5)
+        assert set(summary[space]["cos@100"]) == {"mean", "median", "p10", "p90"}
+    # No bare ``cos@K``: a summary never leaves its space implicit, and an
+    # older file that does is distinguishable from a newer one at a glance.
+    assert "cos@100" not in summary
     assert summary["zero_prediction_spectra"] == 1
 
 

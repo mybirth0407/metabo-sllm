@@ -21,7 +21,11 @@ from metabo_sllm.evaluation.inference import (
     assert_no_leakage,
     predict_spectrum,
 )
-from metabo_sllm.evaluation.spectrum_metrics import BinningConfig, score_prediction
+from metabo_sllm.evaluation.spectrum_metrics import (
+    PRIMARY_SPACE,
+    BinningConfig,
+    score_prediction,
+)
 from metabo_sllm.model.formula_decoder import StructuredFormulaDecoder
 from metabo_sllm.model.fragment_latent_model import ModelOutput
 from metabo_sllm.model.heads import IntensityHead, IonStateHead, PresenceHead
@@ -121,7 +125,7 @@ def test_condition_names_mark_every_oracle():
 # ------------------------------------------------------------------ ceilings
 
 
-def _cosine(mz, intensity, true_mz, true_intensity):
+def _cosine(mz, intensity, true_mz, true_intensity, *, space=PRIMARY_SPACE):
     return score_prediction(
         "uid",
         np.asarray(mz, dtype=np.float64),
@@ -129,28 +133,41 @@ def _cosine(mz, intensity, true_mz, true_intensity):
         np.asarray(true_mz, dtype=np.float64),
         np.asarray(true_intensity, dtype=np.float64),
         BinningConfig(),
-    ).cosine[100]
+    ).cosine[space][100]
 
 
 def test_oracle_identity_with_oracle_weights_is_a_ceiling():
+    """Oracle weights are the raw observation, so they are perfect in legacy_raw."""
     true_mz = np.array([100.0, 200.0, 300.0])
     true_intensity = np.array([1.0, 0.5, 0.25])
 
-    perfect = _cosine(true_mz, true_intensity, true_mz, true_intensity)
-    wrong_identity = _cosine([111.0, 222.0, 333.0], true_intensity, true_mz, true_intensity)
+    perfect = _cosine(true_mz, true_intensity, true_mz, true_intensity, space="legacy_raw")
+    wrong_identity = _cosine(
+        [111.0, 222.0, 333.0], true_intensity, true_mz, true_intensity, space="legacy_raw"
+    )
 
     assert perfect == pytest.approx(1.0)
     assert wrong_identity < perfect
 
 
-def test_sqrt_weights_cost_is_visible():
-    """The model predicts sqrt-scaled intensity; the metric compares raw."""
+def test_each_weighting_is_perfect_in_exactly_one_space():
+    """Which weights count as "correct" is a property of the space, not the model.
+
+    Raw weights are perfect against a raw observation and wrong against a
+    square-root one; square-root weights -- what the intensity head actually
+    emits -- are the mirror image.  Reporting one number without naming its
+    space is what let a square-root prediction be scored against raw
+    intensities for the whole pilot.
+    """
     true_mz = np.array([100.0, 200.0, 300.0])
     raw = np.array([100.0, 4.0, 1.0])
     root = np.sqrt(raw)
 
-    assert _cosine(true_mz, raw, true_mz, raw) == pytest.approx(1.0)
-    assert _cosine(true_mz, root, true_mz, raw) < 1.0
+    assert _cosine(true_mz, raw, true_mz, raw, space="legacy_raw") == pytest.approx(1.0)
+    assert _cosine(true_mz, raw, true_mz, raw, space=PRIMARY_SPACE) < 1.0
+
+    assert _cosine(true_mz, root, true_mz, raw, space=PRIMARY_SPACE) == pytest.approx(1.0)
+    assert _cosine(true_mz, root, true_mz, raw, space="legacy_raw") < 1.0
 
 
 # ---------------------------------------------------------------------- beam

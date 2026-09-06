@@ -43,6 +43,8 @@ from metabo_sllm.evaluation.inference import (  # noqa: E402
 )
 from metabo_sllm.evaluation.spectrum_metrics import (  # noqa: E402
     BinningConfig,
+    EVALUATION_SPACES,
+    PRIMARY_SPACE,
     score_prediction,
 )
 from metabo_sllm.model.qwen_encoder import load_tokenizer  # noqa: E402
@@ -148,12 +150,13 @@ def main(argv: list[str] | None = None) -> int:
                     score = score_prediction(
                         record.spectrum_uid, mz, intensity, observed_mz, observed_intensity, binning
                     )
-                    cosines[name].append(score.cosine[100])
-                    cosines20[name].append(score.cosine[20])
+                    cosines[name].append(score.cosine[PRIMARY_SPACE][100])
+                    cosines20[name].append(score.cosine[PRIMARY_SPACE][20])
                     zero_counts[name] += int(score.zero_prediction)
                     peak_counts[name].append(score.predicted_peaks)
-                    entry[f"cos100_{name}"] = score.cosine[100]
-                    entry[f"cos20_{name}"] = score.cosine[20]
+                    for space in EVALUATION_SPACES:
+                        entry[f"cos100_{name}_{space}"] = score.cosine[space][100]
+                        entry[f"cos20_{name}_{space}"] = score.cosine[space][20]
                 identity = record.identity
                 for key in (
                     "matched_pairs", "greedy_in_bag", "greedy_formula_in_bag",
@@ -200,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         values20 = np.asarray(cosines20[name])
         conditions_summary[name] = {
             "oracle": name != "all_predicted" and not name.startswith("beam"),
+            "space": PRIMARY_SPACE,
             "cos@100": distribution(values),
             "cos@20": distribution(values20),
             "zero_prediction_spectra": zero_counts[name],

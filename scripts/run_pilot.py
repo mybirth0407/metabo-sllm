@@ -31,7 +31,7 @@ from evaluate_fragment_model import evaluate_fold  # noqa: E402
 from metabo_sllm.data.fragment_collator import FragmentCollator  # noqa: E402
 from metabo_sllm.data.fragment_dataset import FragmentSupervisionDataset  # noqa: E402
 from metabo_sllm.evaluation.prediction_writer import write_predictions  # noqa: E402
-from metabo_sllm.evaluation.spectrum_metrics import BinningConfig  # noqa: E402
+from metabo_sllm.evaluation.spectrum_metrics import BinningConfig, PRIMARY_SPACE  # noqa: E402
 from metabo_sllm.losses.fragment_losses import LossWeights  # noqa: E402
 from metabo_sllm.model.qwen_encoder import load_tokenizer  # noqa: E402
 from metabo_sllm.training.checkpoint import supervision_manifest_hash  # noqa: E402
@@ -249,8 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         append_jsonl(output / "valid_metrics.jsonl", summary, context)
         if context.is_main:
             print(
-                f"[valid] {tag:<8} cos@100={summary['cos@100']['mean']:.4f} "
-                f"cos@20={summary['cos@20']['mean']:.4f} "
+                f"[valid] {tag:<8} "
+                f"cos@100={summary[PRIMARY_SPACE]['cos@100']['mean']:.4f} "
+                f"cos@20={summary[PRIMARY_SPACE]['cos@20']['mean']:.4f} "
+                f"(legacy_raw cos@100={summary['legacy_raw']['cos@100']['mean']:.4f}) "
                 f"bag_hit={summary['fragment_diagnostic']['fragment_bag_hit']} "
                 f"zero={summary['zero_prediction_spectra']} "
                 f"peaks={summary['predicted_peaks']['mean']:.1f} "
@@ -261,7 +263,9 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     baseline, _, _ = validate("step-0", 0)
-    best = {"cos@100": -1.0, "cos@20": -1.0, "epoch": None}
+    # Selection runs on the primary space; the legacy number is recorded
+    # beside it so the two can be compared, never so it can pick the winner.
+    best = {"space": PRIMARY_SPACE, "cos@100": -1.0, "cos@20": -1.0, "epoch": None}
 
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
@@ -288,12 +292,15 @@ def main(argv: list[str] | None = None) -> int:
         valid_summary, predictions, scores = validate(f"epoch{epoch}", epoch)
         trainer.save(output / "checkpoints" / "last")
 
-        current = (valid_summary["cos@100"]["mean"], valid_summary["cos@20"]["mean"])
+        primary = valid_summary[PRIMARY_SPACE]
+        current = (primary["cos@100"]["mean"], primary["cos@20"]["mean"])
         incumbent = (best["cos@100"], best["cos@20"])
         if current > incumbent:
             best = {
+                "space": PRIMARY_SPACE,
                 "cos@100": current[0],
                 "cos@20": current[1],
+                "cos@100_legacy_raw": valid_summary["legacy_raw"]["cos@100"]["mean"],
                 "epoch": epoch,
                 "global_step": trainer.global_step,
             }
