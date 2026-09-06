@@ -164,6 +164,7 @@ class FragmentSupervisionDataset:
     def __len__(self) -> int:
         return self.table.num_rows
 
+
     def __getitem__(self, index: int) -> dict:
         if index < 0:
             index += len(self)

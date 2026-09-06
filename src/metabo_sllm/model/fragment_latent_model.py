@@ -44,6 +44,7 @@ class ModelConfig:
     formula_num_heads: int = 4
     formula_max_count: int = 512
     formula_max_elements: int = 32
+    formula_dropout: float = 0.0
     head_hidden_dim: int = 256
     head_dropout: float = 0.0
     match_intensity_weight: float = 0.25
@@ -104,6 +105,7 @@ class FragmentLatentModel(nn.Module):
             num_heads=config.formula_num_heads,
             max_count=config.formula_max_count,
             max_elements=config.formula_max_elements,
+            dropout=config.formula_dropout,
         )
         self.ion_head = IonStateHead(
             config.slot_hidden_dim,

@@ -66,6 +66,7 @@ def build(config) -> tuple[FragmentLatentModel, FragmentCollator, LossWeights]:
         formula_num_heads=config.formula_decoder.num_heads,
         formula_max_count=config.formula_decoder.max_count,
         formula_max_elements=config.formula_decoder.max_elements,
+        formula_dropout=config.formula_decoder.dropout,
         head_hidden_dim=config.heads.hidden_dim,
         head_dropout=config.heads.dropout,
         match_intensity_weight=config.matching.intensity_weight,

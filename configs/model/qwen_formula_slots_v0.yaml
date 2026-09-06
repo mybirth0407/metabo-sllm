@@ -50,6 +50,10 @@ formula_decoder:
   max_count: 512
   max_elements: 32
   element_vocabulary: atomic_numbers_1_to_118
+  # Must stay 0.0: the two-pass scorer evaluates candidates once for matching
+  # and once for the matched pairs, and any dropout here would make the
+  # assignment and the loss disagree.
+  dropout: 0.0
 
 heads:
   hidden_dim: 256

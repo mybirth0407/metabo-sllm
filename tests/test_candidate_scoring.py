@@ -306,6 +306,69 @@ def test_gradients_are_chunk_invariant():
 # --------------------------------------------------------------- zero targets
 
 
+def _bag_nll_from_cost(cost, contribution, batch, assignment):
+    """Undo the Huber term so the matching cost's own bag NLL is comparable."""
+    bag = cost - WEIGHT * pairwise_huber(
+        contribution, batch["target_intensities"], delta=DELTA
+    )
+    return bag[assignment.batch_index, assignment.slot_index, assignment.target_index]
+
+
+def test_two_passes_agree_in_train_mode():
+    """Pass 1 decides the assignment, Pass 2 supplies the loss.
+
+    They must see the same distribution, or the model is matched against one
+    sample and trained on another. That is only true while the formula decoder
+    has no dropout, which is why its default is 0.0.
+    """
+    decoder, ion_head = build_parts()
+    decoder.train()
+    ion_head.train()
+    batch = make_batch()
+    slots, contribution = slots_and_gates()
+
+    cost = matching_cost_no_grad(
+        decoder,
+        ion_head,
+        slots,
+        contribution,
+        batch,
+        candidate_chunk_size=4,
+        match_intensity_weight=WEIGHT,
+        huber_delta=DELTA,
+    )
+    assignment = hungarian_assign(cost, batch["target_peak_mask"])
+    matched = matched_bag_nll(decoder, ion_head, slots, batch, assignment, candidate_chunk_size=3)
+    from_cost = _bag_nll_from_cost(cost, contribution, batch, assignment)
+
+    assert decoder.training and ion_head.training
+    assert torch.max(torch.abs(matched - from_cost)) <= 1e-6
+
+
+def test_formula_decoder_defaults_to_no_dropout():
+    decoder = StructuredFormulaDecoder(SLOT_DIM, hidden_dim=16, num_layers=1, num_heads=4)
+
+    dropouts = [
+        module.p for module in decoder.modules() if isinstance(module, torch.nn.Dropout)
+    ]
+    assert dropouts, "expected the transformer body to contain dropout modules"
+    assert all(p == 0.0 for p in dropouts)
+
+
+def test_train_mode_scoring_is_repeatable():
+    decoder, ion_head = build_parts()
+    decoder.train()
+    batch = make_batch()
+    slots, contribution = slots_and_gates()
+    cost = matching_cost_no_grad(decoder, ion_head, slots, contribution, batch)
+    assignment = hungarian_assign(cost, batch["target_peak_mask"])
+
+    first = matched_bag_nll(decoder, ion_head, slots, batch, assignment)
+    second = matched_bag_nll(decoder, ion_head, slots, batch, assignment)
+
+    assert torch.max(torch.abs(first - second)) <= 1e-6
+
+
 def test_spectrum_without_targets_scores_nothing():
     decoder, ion_head = build_parts()
     batch = make_batch()

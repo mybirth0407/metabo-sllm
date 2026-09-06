@@ -40,7 +40,11 @@ class StructuredFormulaDecoder(nn.Module):
         max_count: int = 512,
         max_atomic_number: int = 118,
         max_elements: int = 32,
-        dropout: float = 0.1,
+        # Zero by default: candidates are scored twice per step -- once to
+        # build the matching cost, once for the matched pairs -- and dropout
+        # would make those two passes disagree, so the assignment would be
+        # chosen against a different distribution than the loss is taken from.
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.max_count = max_count

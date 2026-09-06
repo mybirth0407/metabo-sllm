@@ -37,6 +37,7 @@ from metabo_sllm.data.fragment_collator import (  # noqa: E402
 from metabo_sllm.data.fragment_dataset import FragmentSupervisionDataset  # noqa: E402
 from metabo_sllm.data.supervision import FIXED_SLOT_COUNT  # noqa: E402
 from metabo_sllm.losses.fragment_losses import spectrum_cosine_loss  # noqa: E402
+from metabo_sllm.losses.matching import pairwise_huber  # noqa: E402
 from metabo_sllm.model.fragment_latent_model import training_step  # noqa: E402
 from metabo_sllm.rendering.spectrum import deterministic  # noqa: E402
 from smoke_fragment_model import build, seed_everything, to_device  # noqa: E402
@@ -439,6 +440,18 @@ def run_stress(args, config) -> dict:
     losses.total.backward()
     backward_seconds = time.perf_counter() - started
 
+    # Pass 1 picked the assignment, Pass 2 produced the loss: on the real model
+    # in train mode they must still be scoring the same distribution.
+    assignment = outputs.extras["assignment"]
+    cost = outputs.extras["matching_cost"]
+    bag_from_cost = cost - model.config.match_intensity_weight * pairwise_huber(
+        outputs.contribution.detach(), batch["target_intensities"], delta=model.config.huber_delta
+    )
+    recovered = bag_from_cost[
+        assignment.batch_index, assignment.slot_index, assignment.target_index
+    ]
+    pass_gap = float((outputs.extras["matched_bag_nll"] - recovered).abs().max())
+
     tensorised = int(batch["candidate_mask"].sum())
     per_row_tensorised = batch["candidate_mask"].sum(dim=1).cpu().tolist()
     stored_total = sum(entry["total_candidates_in_row"] for entry in selection)
@@ -499,6 +512,10 @@ def run_stress(args, config) -> dict:
             and torch.isfinite(outputs.extras["matching_cost"]).all()
         ),
         "matched_pairs": losses.extras["matched_pairs"],
+        "train_mode": model.training,
+        "pass1_pass2_matched_nll_max_abs_diff": pass_gap,
+        "pass1_pass2_agree": pass_gap <= 1e-6,
+        "candidate_truncation": 0,
         "gradients": {
             "qwen_base_params_with_grad": base_grads,
             "lora_params_with_grad": lora_grads,
