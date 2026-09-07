@@ -34,7 +34,7 @@ from metabo_sllm.evaluation.prediction_writer import write_predictions  # noqa: 
 from metabo_sllm.evaluation.spectrum_metrics import BinningConfig, PRIMARY_SPACE  # noqa: E402
 from metabo_sllm.losses.fragment_losses import LossWeights  # noqa: E402
 from metabo_sllm.model.qwen_encoder import load_tokenizer  # noqa: E402
-from metabo_sllm.training.checkpoint import supervision_manifest_hash  # noqa: E402
+from metabo_sllm.training.checkpoint import load_checkpoint, supervision_manifest_hash  # noqa: E402
 from metabo_sllm.training.distributed import DistributedContext, gather_objects  # noqa: E402
 from metabo_sllm.training.dynamic_batch_sampler import (  # noqa: E402
     BatchBudgets,
@@ -136,6 +136,16 @@ def main(argv: list[str] | None = None) -> int:
     collator = FragmentCollator(tokenizer, max_text_length=config.data.max_text_length)
     model.to(context.device)
 
+    # A warm start takes only the weights: the optimizer, the schedule and the
+    # sampler position begin afresh under this config, so a run that went
+    # wrong in its optimisation regime can continue from what it has learned
+    # rather than from scratch.
+    init_from = config.training.get("init_from")
+    if init_from:
+        load_checkpoint(init_from, model=model, map_location=context.device, restore_rng=False)
+        if context.is_main:
+            print(f"[pilot] warm start: weights from {init_from}", flush=True)
+
     costs = train_set.cost_table(
         tokenizer=tokenizer, max_text_length=config.data.max_text_length
     )
@@ -231,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         "total_optimizer_steps": total_steps,
         "warmup_steps": warmup_steps,
         "sampler": sampler.diagnostics().__dict__,
+        "init_from": str(init_from) if init_from else None,
         "test_fold_accessed": False,
     }
     if context.is_main:
@@ -297,6 +308,20 @@ def main(argv: list[str] | None = None) -> int:
         valid_summary, predictions, scores = validate(f"epoch{epoch}", epoch)
         trainer.save(output / "checkpoints" / "last")
 
+        # Every epoch's predictions are kept, presence values included, so a
+        # threshold sweep or an error breakdown can be run afterwards on any
+        # epoch without re-running the model.
+        gathered = [p for bucket in gather_objects(predictions, context) for p in bucket]
+        gathered_scores = [s for bucket in gather_objects(scores, context) for s in bucket]
+        if context.is_main:
+            write_predictions(
+                output / "predictions" / f"valid_epoch{epoch:02d}.parquet",
+                gathered,
+                gathered_scores,
+                fold=config.data.valid_fold,
+                metadata={"epoch": epoch, "run": config.name},
+            )
+
         primary = valid_summary[PRIMARY_SPACE]
         current = (primary["cos@100"]["mean"], primary["cos@20"]["mean"])
         incumbent = (best["cos@100"], best["cos@20"])
@@ -310,8 +335,6 @@ def main(argv: list[str] | None = None) -> int:
                 "global_step": trainer.global_step,
             }
             trainer.save(output / "checkpoints" / "best")
-            gathered = [p for bucket in gather_objects(predictions, context) for p in bucket]
-            gathered_scores = [s for bucket in gather_objects(scores, context) for s in bucket]
             if context.is_main:
                 write_predictions(
                     output / "predictions" / "valid_best.parquet",
