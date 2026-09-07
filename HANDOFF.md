@@ -112,6 +112,21 @@ precursor m/z: 0.638 (<200), 0.578 (200–300), 0.501 (300–400), 0.460
 (400–600), 0.463 (≥600). Distribution is wide: median 0.549, p10 0.068,
 p90 0.889.
 
+Free-running prediction on a 4,000-spectrum **train** sample with the same
+checkpoint: canonical cos@100 **0.808** (83 % of the ceiling), bag_hit 0.613,
+active-slot precision 0.635, unique-bag hit 0.671 — against 0.515 / 0.388 /
+0.47 / 0.451 on valid. The dominant residual is generalization, not capacity
+or the objective.
+
+Counterfactuals on the post-fix best (canonical cos@100): all_predicted 0.5151;
+oracle ion 0.5152 (no effect); presence forced on matched 0.5398; oracle
+identity with model weights 0.5784; model identity with oracle weights
+**0.6229**; both 0.9688. Unlike the pre-fix pilot, the weight component
+(presence × intensity) is now the larger single lever, and the two errors are
+entangled (fixing one leaves ~0.4 on the table). The full research report with
+the ranked experiment plan is
+`docs/research/performance_improvement_report_2026-09-08.md`.
+
 **One experiment did not work and should not be repeated as designed.** A
 set-level identity term — SCARF's prefix-tree objective in marginal form,
 conditioned on a pooled molecule vector and sharing the slot decoder's
