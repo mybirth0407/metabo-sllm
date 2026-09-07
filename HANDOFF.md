@@ -336,9 +336,13 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 ## 9. Repository state
 
 Branch `worktree-training-pipeline-v0` (worktree at
-`.claude/worktrees/training-pipeline-v0`), sixteen commits ahead of `main`:
+`.claude/worktrees/training-pipeline-v0`), twenty commits ahead of `main` (this handoff's own commit will make it twenty):
 
 ```
+272db1e Add performance-improvement research report; record post-fix counterfactuals in HANDOFF
+48156ca handoff: post-fix run outcome, identity residuals, bag sizes, stratified cosine
+b5ce59f add the Phase 2 literature packs for the performance research question
+882cf31 handoff: the two training defects, corrected numbers, and the post-fix run
 c3b8a4d add the first full-split config to run with the training defects fixed
 876aa41 fix two silent training defects: unsynchronised ranks, and a decoder that never learned
 a704707 record the first full-split run's collapse and the warm-start continuation
