@@ -79,16 +79,38 @@ A warm-start continuation of that run (`..._full_warm_seed0`, lr 8e-5, presence
 0.5) was started and then stopped once the defects were found: its "presence
 collapse" diagnosis was itself an artefact of four diverging ranks.
 
-**Now running — the first post-fix run:**
+**The first post-fix run — the current best model:**
 `bmscaffold_1/qwen_formula_slots_v1_full_fixed_seed0`, config
 `configs/train/qwen_formula_slots_v1_full_fixed.yaml`. Warm-started from the
-V1 rank-0 checkpoint (0.3481; encoder adapter, slots and heads trained, decoder
-body at initialisation), lr 1.5e-4 at a real effective batch of 256, presence
-0.2, 8 epochs, launched 2026-09-07 ~10:40 UTC. Predictions are written every
-epoch (`predictions/valid_epochNN.parquet`). Its checkpoints reproduce their
-logged validation (verified on the smoke to 4 decimals). Log:
-`$CLAUDE_JOB_DIR/tmp/full_fixed_train.txt`; stop with
-`pkill -f qwen_formula_slots_v1_full_fixed`.
+V1 rank-0 checkpoint (0.3418 on the full valid fold at step 0), lr 1.5e-4 at a
+real effective batch of 256, presence 0.2. Planned for 8 epochs; stopped by
+request after epoch 6 (2026-09-08 ~16:25 UTC). `best` = `last` = epoch 6,
+step 24,919. Valid canonical cos@100 by epoch: 0.443, 0.464, 0.483, 0.502,
+0.508, 0.510, **0.515** — 53 % of the 0.9725 ceiling (the full valid fold's
+oracles equal the subset's: formula_rendered 0.9725, slot_capacity 0.9684).
+Train bag NLL 1.79 → 0.83 and train bag_hit 0.52 → 0.70 over the same epochs
+while valid bag_hit went 0.33 → 0.385 → 0.365 → 0.388: the train/valid gap on
+identity is the live question, with the caveat that lr was already decaying
+when valid flattened. Predictions for every epoch are in
+`predictions/valid_epochNN.parquet` (presence values included); raising the
+presence threshold above 0.5 only hurts (0.6 → 0.501, 0.9 → 0.423).
+
+Post-fix identity errors (valid, 2.75 M active slots, epoch 6): hit 54.0 %
+(pre-fix 28.3 %); of the misses, one heavy atom off 22.9 %, two 9.9 %,
+hydrogen-only 5.0 %, far 8.3 % (pre-fix 29.1 %); median miss sits 2.0 Da from
+the nearest observed peak. Valence violations are 0 % on both sides (v2 bags);
+97.5 % of miss formulas occur ≥20 times in train. Per-peak bag sizes among
+supervised peaks: 80.7 % singletons (83.5 % of intensity), 14.2 % of size 2–3,
+5.1 % larger — so bag-ambiguity objectives (hard-EM, RC/PRODEN) can touch at
+most ~5 % of peaks. The residual is discrimination among near formulas on
+singleton bags, not ambiguity resolution.
+
+Stratified (epoch 6, canonical cos@100): precursor formula **seen in train
+0.599 (42.6 % of valid) vs unseen 0.453 (57.4 %)** — formula novelty alone
+accounts for a 0.146 gap, the generalization signature RQ1 asked for. By
+precursor m/z: 0.638 (<200), 0.578 (200–300), 0.501 (300–400), 0.460
+(400–600), 0.463 (≥600). Distribution is wide: median 0.549, p10 0.068,
+p90 0.889.
 
 **One experiment did not work and should not be repeated as designed.** A
 set-level identity term — SCARF's prefix-tree objective in marginal form,
