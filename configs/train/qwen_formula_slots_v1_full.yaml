@@ -1,0 +1,76 @@
+# The V1 configuration on the full split, bmscaffold_1.
+#
+# The subset run converged at canonical cos@100 = 0.2505 -- more epochs on the
+# same 88,743 training spectra stopped helping -- so the next lever is data:
+# train here is 891,038 spectra, ten times the subset. Everything else is V1:
+# Qwen3-0.6B-Base frozen, LoRA r=64, the same decoder stack, batch, lr and
+# schedule shape, no prefix term.
+#
+# Bags are fragment_supervision_v2 (valence-implausible candidates dropped at
+# build time; on the subset that removed 6.9 % of candidates and cost the V1
+# checkpoint 5 of 91,236 bag hits). That is the one difference from the subset
+# run besides the data.
+#
+# Eight epochs is ~3,480 optimizer steps each, ~27,800 in all: 2.8x the step
+# count at which the subset run peaked, on ten times the data. Valid is the
+# full 109,817-spectrum fold, evaluated every epoch.
+
+name: qwen_formula_slots_v1_full_seed0
+
+model_config: configs/model/qwen_formula_slots_v1.yaml
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/bmscaffold_1/fragment_supervision_v2
+  fold: train
+  valid_fold: valid          # test is never named anywhere in this pipeline
+  num_shards: 64
+  exclude_zero_target_train: true
+  max_text_length: 512
+
+batching:
+  max_spectra: 64
+  max_qwen_tokens: 16384
+  max_linked_candidates: 8192
+  bucket_multiplier: 50
+
+training:
+  precision: bf16
+  gradient_accumulation_steps: 1
+  max_grad_norm: 5.0
+  find_unused_parameters: false
+  ddp_no_sync: true
+  epochs: 8
+  max_steps: 0               # 0 = run whole epochs
+  log_every: 100
+  save_every: 0
+  seed: 0
+  output_dir: /NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/bmscaffold_1/qwen_formula_slots_v1_full_seed0
+
+optimizer:
+  type: AdamW
+  fused: true
+  learning_rate: 1.5e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.05
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+evaluation:
+  upper_limit: 1500
+  num_bins: 15000
+  min_pred_intensity: 1.0e-5
+  top_k: [20, 100]
+  presence_threshold: 0.5
+  batch_size: 64
+  primary_metric: cos@100
+  tiebreak_metric: cos@20
