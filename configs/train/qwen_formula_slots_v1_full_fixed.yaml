@@ -1,0 +1,79 @@
+# Full split, first run after the two training defects were fixed.
+#
+# Until commit "fix two silent training defects", every multi-GPU run had
+# trained four unsynchronised models (the forward bypassed the DDP wrapper)
+# and a formula decoder whose linear weights never received a gradient (the
+# bf16 autocast cache was first filled under no_grad). This is the first run
+# in which the decoder learns and the ranks share one model.
+#
+# It starts from the best saved model so far: rank 0 of the V1 subset run,
+# canonical cos@100 0.3481 on the subset's valid fold with a decoder body at
+# initialisation. Its encoder adapter, slot decoder and heads are kept; the
+# decoder learns from here. scaffold_sub_10's folds are subsets of
+# bmscaffold_1's (valid ⊂ valid, train ⊂ train, no crossing), so this warm
+# start leaks nothing.
+#
+# lr 1.5e-4 is the subset's value, now at a real effective batch of 256;
+# presence returns to 0.2 -- the 0.5 was a response to a symptom that turned
+# out to be rank divergence.
+
+name: qwen_formula_slots_v1_full_fixed_seed0
+
+model_config: configs/model/qwen_formula_slots_v1.yaml
+
+data:
+  root: /NHNHOME/26moe001_B/BASE/metabo_data/processed/metabo_sllm/nist23/bmscaffold_1/fragment_supervision_v2
+  fold: train
+  valid_fold: valid          # test is never named anywhere in this pipeline
+  num_shards: 64
+  exclude_zero_target_train: true
+  max_text_length: 512
+
+batching:
+  max_spectra: 64
+  max_qwen_tokens: 16384
+  max_linked_candidates: 8192
+  bucket_multiplier: 50
+
+training:
+  precision: bf16
+  gradient_accumulation_steps: 1
+  max_grad_norm: 5.0
+  find_unused_parameters: false
+  ddp_no_sync: true
+  epochs: 8
+  max_steps: 0               # 0 = run whole epochs
+  log_every: 100
+  save_every: 0
+  seed: 0
+  output_dir: /NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/bmscaffold_1/qwen_formula_slots_v1_full_fixed_seed0
+  init_from: /NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/scaffold_sub_10/qwen_formula_slots_v1_base_seed0/checkpoints/best
+
+optimizer:
+  type: AdamW
+  fused: true
+  learning_rate: 1.5e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.05
+
+loss:
+  identity: 1.0
+  presence: 0.2
+  intensity: 1.0
+  spectrum: 1.0
+
+evaluation:
+  upper_limit: 1500
+  num_bins: 15000
+  min_pred_intensity: 1.0e-5
+  top_k: [20, 100]
+  presence_threshold: 0.5
+  batch_size: 64
+  primary_metric: cos@100
+  tiebreak_metric: cos@20
