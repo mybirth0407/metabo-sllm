@@ -23,6 +23,25 @@ spectra). All numbers are on the full valid fold.
 → 0.0036 and then went negative: epoch 27 = 0.2505, epoch 30 = 0.2463, epoch 31 =
 0.2471. More epochs on this data will not help.
 
+**A third run is in progress:** `bmscaffold_1/qwen_formula_slots_v1_full_seed0` —
+the V1 configuration on the full split (train 891,038 spectra, 10x), 8 epochs,
+~27,800 optimizer steps, `fragment_supervision_v2` bags, launched 2026-09-07
+06:34 UTC, ~9.4 h. Log: `$CLAUDE_JOB_DIR/tmp/full_train.txt`; stop with
+`pkill -f qwen_formula_slots_v1_full`.
+
+**One experiment did not work and should not be repeated as designed.** A
+set-level identity term — SCARF's prefix-tree objective in marginal form,
+conditioned on a pooled molecule vector and sharing the slot decoder's
+parameters (`losses/prefix_loss.py`, `configs/train/qwen_formula_slots_v1_prefix_subset.yaml`)
+— was behind V1 on valid at every epoch and behind on *train* by epoch 7
+(valid 0.1351 vs 0.1680; train bag NLL 3.69 vs 3.39). The molecule-conditioned
+marginal (broad, "every fragment of this molecule") and the slot-conditioned
+decoding (peaked, "this slot's one fragment") interfere on one decoder body and
+head. Withdrawing the weight (0.9/epoch) did not recover it. The code stays,
+defaults to off, and is byte-for-byte the old objective at weight 0. What the
+failure supports: bolting set-level supervision onto per-slot generation does
+not transfer; the per-slot generation itself is what to replace.
+
 Run directories (under
 `/NHNHOME/26moe001_B/BASE/metabo_data/results/metabo_sllm/nist23/scaffold_sub_10/`):
 
@@ -88,11 +107,16 @@ Processed, under `metabo_data/processed/metabo_sllm/nist23/<split>/`:
 
 | split | artifact | train | valid | note |
 |---|---|---|---|---|
-| `scaffold_sub_10` | `spectra_v1`, `spectra_v2`, `formula_support_audit_v0`, `fragment_supervision_v1` | 88,743 | 10,988 | what both runs used |
-| `bmscaffold_1` | `spectra_v1`, `spectra_v2`, `fragment_supervision_v1` | **891,038** | 109,817 | **ready, unused** |
+| `scaffold_sub_10` | `spectra_v1`, `spectra_v2`, `formula_support_audit_v0`, `fragment_supervision_v1`, `fragment_supervision_v2` | 88,743 | 10,988 | V0/V1 used v1 bags |
+| `bmscaffold_1` | `spectra_v1`, `spectra_v2`, `fragment_supervision_v1`, `fragment_supervision_v2` | **891,038** | 109,817 | the full run uses v2 |
 
-`bmscaffold_1/fragment_supervision_v1` is built and verified: 39.2 M peaks, 52.9 M
-edges. The `test` fold is deliberately not built for supervision.
+`fragment_supervision_v2` = v1 minus candidates that fail the two hard valence
+bounds (RDBE ≥ 0; monovalent atoms ≤ 2(C+Si)+2+(N+P)). Same columns; the reader
+accepts both. On the subset it drops 346,794 of 5,029,102 candidates (6.9 %) and
+costs the V1 checkpoint 5 of 91,236 bag hits; on the full split 4,055,150 of
+52,906,460 (7.7 %). Softer rules (fragment RDBE ≤ precursor + 1) were measured
+and *not* applied: they also exclude 4.6 % of formulas real hits take. The
+`test` fold is deliberately not built for supervision.
 
 Backbones, both local-only (`local_files_only=True`, never downloads):
 `models/qwen3-0.6b` (post-trained, used by V0) and `models/qwen3-0.6b-base`
@@ -148,18 +172,23 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 
 ## 6. Open work, in the order proposed
 
-1. **Full-data training on `bmscaffold_1`.** The subset has converged, the data is
-   built, and this is the only item that can start immediately. ~68 min/epoch at the
-   V1 configuration (train 891,038 spectra, ~3,480 optimizer steps/epoch); valid is
-   109,817 spectra, ~2.5 min per evaluation. Budget not yet chosen — 8 epochs is
-   ~9.4 h and reaches 2.8x the subset's best step count.
+1. **Full-data training on `bmscaffold_1`** — running (see §1). Read its result
+   against the subset's 0.2505: it says what ten times the data buys at fixed
+   architecture.
 2. **Replace per-slot formula generation with scoring over an enumerated candidate
-   set.** This is the change that attacks the measured bottleneck. The precursor
-   formula is a *model input*, so enumerating its subformulas at inference is not
-   leakage, and `chem/candidates.generate_candidates` already does the enumeration.
-   Either a GrAFF-MS-style fixed vocabulary with per-precursor masking (cheap,
-   single forward) or full per-precursor enumeration and scoring (faithful,
-   expensive for large precursors).
+   set.** This is the change that attacks the measured bottleneck, and the prefix
+   experiment's failure points here too. The precursor formula is a *model input*,
+   so enumerating its subformulas at inference is not leakage, and
+   `chem/candidates.generate_candidates` already does the enumeration. The
+   evidence: GrAFF-MS scores a fixed vocabulary (10k products + losses, 98 % ion
+   coverage on NIST20) with one softmax and reaches 0.658 scaffold; SCARF's
+   FixedVocab baseline (5k) reaches 0.704/0.658 against SCARF's own 0.726/0.669;
+   and in our own diagnostic 80 % of V1's miss formulas occur ≥20 times in train,
+   so a 20-30k vocabulary covers 98.4 % of hits. Shape it as: candidates =
+   (vocab ∩ subformulas(precursor)) ∪ (precursor − loss-vocab), valence-filtered;
+   slots attend over candidates with a softmax so they compete; positions are
+   always candidate masses; intensity is weighted per candidate. Keep the two-pass
+   scorer's memory discipline.
 3. **Cross-slot competition.** 9 % of active slots currently decode to a duplicate
    identity; slots do not compete.
 4. **Joint modelling of a molecule's collision-energy siblings.** They already share
@@ -200,9 +229,13 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 ## 9. Repository state
 
 Branch `worktree-training-pipeline-v0` (worktree at
-`.claude/worktrees/training-pipeline-v0`), six commits ahead of `main`:
+`.claude/worktrees/training-pipeline-v0`), eleven commits ahead of `main`:
 
 ```
+696ac88 add the V1 full-split training config
+ff3e0c2 supervise formula identity at the prefix-tree level, on cleaner bags
+9112615 add an identity-error diagnostic: near or far, valence, vocabulary
+528a6a2 add a handoff covering what is measured, what is open, and what not to redo
 6b53bb1 build supervision shards in parallel, and add the V1 training setup
 5978c9e bring PROJECT_STATE up to date through the evaluation contract audit
 5810ac1 report the cosine in both intensity spaces, and name them
