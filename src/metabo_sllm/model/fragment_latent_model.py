@@ -215,6 +215,7 @@ def training_step(
     weights: LossWeights | None = None,
     *,
     return_full_candidate_scores: bool = False,
+    forward=None,
 ) -> tuple[ModelOutput, object]:
     """Forward, match on a detached cost, then score only the matched pairs.
 
@@ -222,7 +223,10 @@ def training_step(
     the ``[B, 64, C]`` grid the two-pass split exists to avoid, so it defaults
     to off and never runs during training.
     """
-    outputs = model(batch)
+    # Under DDP the forward must go through the wrapper: that call is what
+    # arms the gradient all-reduce for the step. Calling the bare module
+    # trains every rank on its own shard and never synchronises them.
+    outputs = (forward or model)(batch)
     cost = model.compute_matching_cost_no_grad(
         outputs.slots, outputs.presence, outputs.intensity, batch
     )

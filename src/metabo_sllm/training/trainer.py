@@ -107,6 +107,24 @@ def build_scheduler(optimizer, *, total_steps: int, warmup_ratio: float, min_lr_
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
+def autocast_context(precision: str, device_type: str = "cuda"):
+    """The mixed-precision context every training forward runs under.
+
+    ``cache_enabled=False`` is load-bearing.  Autocast caches the bf16 copy it
+    makes of each fp32 weight for the rest of the context.  The candidate
+    scorer runs the formula decoder twice per step -- once under ``no_grad``
+    to build the matching cost, then with gradients on the matched pairs --
+    and a cached copy made inside ``no_grad`` carries no autograd history, so
+    the second pass reused it and the decoder's linear weights received no
+    gradient at all.  LayerNorms and embeddings, which autocast leaves in
+    fp32, were unaffected, which is what made the failure silent.
+    """
+    dtype = _AUTOCAST.get(precision)
+    if dtype is None or device_type != "cuda":
+        return torch.autocast(device_type="cpu", enabled=False)
+    return torch.autocast(device_type="cuda", dtype=dtype, cache_enabled=False)
+
+
 class Trainer:
     def __init__(
         self,
@@ -138,6 +156,11 @@ class Trainer:
 
         self.model = model
         if context.distributed:
+            # A head no loss reads would never receive a gradient, and DDP
+            # refuses to proceed past a parameter it expected one for.
+            if config.loss.prefix == 0.0:
+                for parameter in model.molecule_proj.parameters():
+                    parameter.requires_grad_(False)
             self.model = DistributedDataParallel(
                 model,
                 device_ids=[context.local_rank] if context.device.type == "cuda" else None,
@@ -155,10 +178,7 @@ class Trainer:
     # ------------------------------------------------------------- utilities
 
     def _autocast(self):
-        dtype = _AUTOCAST.get(self.config.precision)
-        if dtype is None or self.context.device.type != "cuda":
-            return torch.autocast(device_type="cpu", enabled=False)
-        return torch.autocast(device_type="cuda", dtype=dtype)
+        return autocast_context(self.config.precision, self.context.device.type)
 
     def _collate(self, indices: list[int]) -> dict:
         rows = [self.dataset[index] for index in indices]
@@ -287,7 +307,7 @@ class Trainer:
                 mark = time.perf_counter()
                 with self._autocast():
                     outputs, losses = training_step(
-                        self.raw_model, batch, self._loss_weights()
+                        self.raw_model, batch, self._loss_weights(), forward=self.model
                     )
                 forward_time += time.perf_counter() - mark
 
@@ -329,6 +349,31 @@ class Trainer:
         if self.config.save_every and self.global_step % self.config.save_every == 0:
             self.save(self.output_dir / f"checkpoint-{self.global_step:08d}")
         return record
+
+    def _assert_ranks_agree(self) -> float:
+        """Largest gap between this rank's trainable parameters and rank 0's.
+
+        Four ranks that silently trained four different models is exactly
+        what this pipeline once did, so a checkpoint is not written until
+        every rank's weights match the ones being saved.
+        """
+        if not self.context.distributed:
+            return 0.0
+        import torch.distributed as dist
+
+        worst = torch.zeros((), device=self.context.device)
+        for parameter in self.trainable:
+            reference = parameter.detach().clone()
+            dist.broadcast(reference, src=0)
+            worst = torch.maximum(worst, (parameter.detach() - reference).abs().max())
+        dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+        gap = float(worst.item())
+        if gap > 0.0:
+            raise RuntimeError(
+                f"ranks disagree on trainable parameters (max |diff| {gap:.3e}); "
+                "gradients are not being synchronised"
+            )
+        return gap
 
     def _sync_context(self, last: bool):
         if last or not self.context.distributed or not self.config.ddp_no_sync:
@@ -406,6 +451,7 @@ class Trainer:
     # ------------------------------------------------------------ checkpoint
 
     def save(self, directory: Path) -> Path | None:
+        self._assert_ranks_agree()
         self.context.barrier()
         if not self.context.is_main:
             self.context.barrier()
