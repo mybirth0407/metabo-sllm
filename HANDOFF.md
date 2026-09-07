@@ -23,11 +23,30 @@ spectra). All numbers are on the full valid fold.
 → 0.0036 and then went negative: epoch 27 = 0.2505, epoch 30 = 0.2463, epoch 31 =
 0.2471. More epochs on this data will not help.
 
-**A third run is in progress:** `bmscaffold_1/qwen_formula_slots_v1_full_seed0` —
-the V1 configuration on the full split (train 891,038 spectra, 10x), 8 epochs,
-~27,800 optimizer steps, `fragment_supervision_v2` bags, launched 2026-09-07
-06:34 UTC, ~9.4 h. Log: `$CLAUDE_JOB_DIR/tmp/full_train.txt`; stop with
-`pkill -f qwen_formula_slots_v1_full`.
+**The first full-split run was stopped after four epochs and continued under a
+different regime.** `bmscaffold_1/qwen_formula_slots_v1_full_seed0` (V1 config,
+lr 1.5e-4, 8 epochs planned, `fragment_supervision_v2` bags) peaked at epoch 0 —
+canonical cos@100 **0.1364** on the full 109,817-spectrum valid fold — then fell
+to 0.1062 / 0.1111 / 0.1193 at epochs 1-3 while train kept improving and
+gradients stayed calm (gnorm 0.7). Between epochs 0 and 1 the presence head
+went from 1,052 zero-prediction spectra to none, predicted peaks per spectrum
+rose 35.9 → 41.1, and active-slot precision collapsed 0.094 → 0.062. Ruled out:
+fold difficulty (same precursor-mass distribution as the subset; 42.6 % of valid
+formulas appear in train vs 11.4 % on the subset — the subset's 0.2505 was
+therefore mostly on *unseen* formulas), supervision density (28-31 candidates
+per spectrum, same as the subset), slot duplicates (lower than the subset). The
+reading: ten times the subset's steps at peak lr drove the presence head open.
+Throughput was 348 spectra/s, 58 % above the subset's.
+
+**Now running:** `bmscaffold_1/qwen_formula_slots_v1_full_warm_seed0` —
+`training.init_from` = that run's epoch-3 `checkpoints/last` (weights only;
+optimizer, schedule and sampler fresh), lr 8e-5, presence weight 0.5, seed 1,
+6 epochs, launched 2026-09-07 09:45 UTC, ~5.5 h. Predictions are now written for
+every epoch (`predictions/valid_epochNN.parquet`, presence values included), so
+presence thresholds can be swept afterwards. Success = beats 0.1364 with
+active-slot precision recovering above 0.068; if not, presence 0.5 is the first
+thing to revert. Log: `$CLAUDE_JOB_DIR/tmp/full_warm_train.txt`; stop with
+`pkill -f qwen_formula_slots_v1_full_warm`.
 
 **One experiment did not work and should not be repeated as designed.** A
 set-level identity term — SCARF's prefix-tree objective in marginal form,
@@ -229,9 +248,11 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 ## 9. Repository state
 
 Branch `worktree-training-pipeline-v0` (worktree at
-`.claude/worktrees/training-pipeline-v0`), eleven commits ahead of `main`:
+`.claude/worktrees/training-pipeline-v0`), thirteen commits ahead of `main`:
 
 ```
+0a68bad warm-start a run from another's weights, and keep every epoch's predictions
+0624abe record the prefix-tree result, the v2 bags, and the running full-split job
 696ac88 add the V1 full-split training config
 ff3e0c2 supervise formula identity at the prefix-tree level, on cleaner bags
 9112615 add an identity-error diagnostic: near or far, valence, vocabulary
