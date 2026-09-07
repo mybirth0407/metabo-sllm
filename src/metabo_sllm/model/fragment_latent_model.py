@@ -15,6 +15,7 @@ from metabo_sllm.losses.candidate_scoring import (
     reference_candidate_log_prob,
 )
 from metabo_sllm.losses.fragment_losses import LossWeights, compute_losses
+from metabo_sllm.losses.prefix_loss import prefix_marginal_nll
 from metabo_sllm.losses.matching import hungarian_assign
 from metabo_sllm.model.formula_decoder import StructuredFormulaDecoder
 from metabo_sllm.model.heads import IntensityHead, IonStateHead, PresenceHead
@@ -72,6 +73,14 @@ class ModelOutput:
     contribution: torch.Tensor
     ion_log_prob: torch.Tensor
     extras: dict = field(default_factory=dict)
+    # the molecule as a whole, in slot space, for supervision that is not
+    # routed through a slot
+    molecule: torch.Tensor | None = None
+
+
+def _masked_mean(memory: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    weight = attention_mask.to(memory.dtype).unsqueeze(-1)
+    return (memory * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
 
 
 class FragmentLatentModel(nn.Module):
@@ -123,6 +132,9 @@ class FragmentLatentModel(nn.Module):
             dropout=config.head_dropout,
         )
         self.ion_state_vocabulary = ION_STATE_VOCABULARY
+        # Pooled encoder memory projected into slot space, so the shared
+        # formula decoder can be conditioned on the molecule itself.
+        self.molecule_proj = nn.Linear(self.encoder.hidden_size, config.slot_hidden_dim)
 
     # ----------------------------------------------------------------- parts
 
@@ -175,7 +187,9 @@ class FragmentLatentModel(nn.Module):
     # --------------------------------------------------------------- forward
 
     def forward(self, batch: dict) -> ModelOutput:
-        slots = self.decode_slots(batch)
+        memory = self.encode(batch)
+        slots = self.slot_decoder(memory, batch["attention_mask"])
+        molecule = self.molecule_proj(_masked_mean(memory, batch["attention_mask"]))
         presence_logits = self.presence_head(slots)
         presence = torch.sigmoid(presence_logits)
         intensity = self.intensity_head(slots)
@@ -191,6 +205,7 @@ class FragmentLatentModel(nn.Module):
             intensity=intensity,
             contribution=contribution,
             ion_log_prob=ion_log_prob,
+            molecule=molecule,
         )
 
 
@@ -213,6 +228,14 @@ def training_step(
     )
     assignment = hungarian_assign(cost, batch["target_peak_mask"])
     matched = model.compute_matched_bag_nll(outputs.slots, batch, assignment)
+    weights = weights or LossWeights()
+    # Only computed when it carries weight: it is a second pass over every
+    # linked candidate, and older configs do not ask for it.
+    prefix = (
+        prefix_marginal_nll(model.formula_decoder, outputs.molecule, batch)
+        if weights.prefix > 0
+        else None
+    )
 
     losses = compute_losses(
         matched_bag_nll=matched,
@@ -224,11 +247,14 @@ def training_step(
         full_peak_intensities=batch["full_peak_intensities"],
         full_peak_mask=batch["full_peak_mask"],
         assignment=assignment,
-        weights=weights or LossWeights(),
+        weights=weights,
         huber_delta=model.config.huber_delta,
+        prefix_nll=prefix,
     )
     outputs.extras["assignment"] = assignment
     outputs.extras["matched_bag_nll"] = matched.detach()
+    if prefix is not None:
+        outputs.extras["prefix_nll"] = prefix.detach()
     outputs.extras["matching_cost"] = cost
     if return_full_candidate_scores or model.config.return_full_candidate_scores:
         outputs.extras["candidate_log_prob"] = reference_candidate_log_prob(

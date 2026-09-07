@@ -31,6 +31,9 @@ __all__ = [
     "ELECTRON_MASS",
     "EnumerationCapExceeded",
     "FormulaError",
+    "hydrogen_excess",
+    "is_valence_plausible",
+    "rdbe",
     "SubformulaTable",
     "atomic_number",
     "element_mass",
@@ -235,3 +238,41 @@ class SubformulaTable:
     def mass(self, heavy_index: int, hydrogen: int) -> float:
         """Monoisotopic mass of the subformula at ``(heavy_index, hydrogen)``."""
         return float(self.heavy_masses[heavy_index]) + hydrogen * element_mass("H")
+
+
+# ------------------------------------------------------------------ valence
+
+_MONOVALENT = ("H", "F", "Cl", "Br", "I", "Na", "K")
+_TRIVALENT = ("N", "P")
+_TETRAVALENT = ("C", "Si")
+
+
+def rdbe(counts: dict[str, int]) -> float:
+    """Ring-and-double-bond equivalents of a neutral formula.
+
+    ``C + Si - (H + halogens + Na + K)/2 + (N + P)/2 + 1``.  Divalent atoms
+    (O, S) contribute nothing.
+    """
+    tetra = sum(counts.get(s, 0) for s in _TETRAVALENT)
+    mono = sum(counts.get(s, 0) for s in _MONOVALENT)
+    tri = sum(counts.get(s, 0) for s in _TRIVALENT)
+    return tetra - mono / 2 + tri / 2 + 1
+
+
+def hydrogen_excess(counts: dict[str, int]) -> int:
+    """Monovalent atoms beyond the saturated maximum ``2(C+Si) + 2 + (N+P)``."""
+    tetra = sum(counts.get(s, 0) for s in _TETRAVALENT)
+    mono = sum(counts.get(s, 0) for s in _MONOVALENT)
+    tri = sum(counts.get(s, 0) for s in _TRIVALENT)
+    return mono - (2 * tetra + 2 + tri)
+
+
+def is_valence_plausible(counts: dict[str, int]) -> bool:
+    """The two hard bounds no real neutral formula violates.
+
+    Only the hard bounds: a negative RDBE or more monovalent atoms than the
+    heavy atoms can carry.  Softer rules -- a fragment's RDBE exceeding the
+    precursor's by more than one, say -- also exclude formulas that genuine
+    fragments do take, so they are not applied here.
+    """
+    return rdbe(counts) >= 0 and hydrogen_excess(counts) <= 0

@@ -63,6 +63,7 @@ class FakeModel(nn.Module):
         self.ion_head = nn.Linear(8, 3)
         self.presence_head = nn.Linear(8, 1)
         self.intensity_head = nn.Linear(8, 1)
+        self.molecule_proj = nn.Linear(8, 8)
 
 
 def make_sampler() -> DynamicBatchSampler:

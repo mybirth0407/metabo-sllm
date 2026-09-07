@@ -48,6 +48,8 @@ import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
+from metabo_sllm.chem.candidates import SpectrumEdges  # noqa: E402
+from metabo_sllm.chem.formula import is_valence_plausible  # noqa: E402
 from metabo_sllm.chem.candidates import (  # noqa: E402
     BOUNDARY_EPS,
     DEFAULT_PPM,
@@ -81,7 +83,7 @@ from metabo_sllm.data.supervision import (  # noqa: E402
     top_slot_mask,
 )
 
-SCHEMA_VERSION = "fragment_supervision_v1"
+SCHEMA_VERSION = "fragment_supervision_v2"
 SOURCE_SCHEMA_VERSION = "spectra_v2"
 MANIFEST_NAME = "manifest.json"
 DIAGNOSTICS_NAME = "diagnostics.json"
@@ -385,6 +387,37 @@ class Diagnostics:
         }
 
 
+def _drop_implausible(table: SubformulaTable, edges: SpectrumEdges, n_peaks: int):
+    """Remove candidates no real neutral formula could be, and their edges.
+
+    A bag member with a negative RDBE, or more monovalent atoms than its heavy
+    atoms can carry, is a mass coincidence rather than a fragment; left in the
+    bag it lets the likelihood reward probability mass on something that cannot
+    exist. In the v1 artifact 7.9 % of candidates were of this kind, and no
+    predicted formula that landed in a bag was.
+    """
+    keys = np.unique(edges.edge_key)
+    if not keys.size:
+        return edges, 0
+    _, heavy_index, hydrogen = key_components(table, keys)
+    plausible = np.fromiter(
+        (
+            is_valence_plausible(table.decode(h, y))
+            for h, y in zip(heavy_index.tolist(), hydrogen.tolist(), strict=True)
+        ),
+        dtype=bool,
+        count=keys.size,
+    )
+    if plausible.all():
+        return edges, 0
+    keep = np.isin(edges.edge_key, keys[plausible])
+    peak = edges.edge_peak_index[keep]
+    counts = np.bincount(peak, minlength=n_peaks).astype(
+        edges.peak_candidate_counts.dtype, copy=False
+    )
+    return SpectrumEdges(counts, peak, edges.edge_key[keep]), int((~plausible).sum())
+
+
 def _build_row(
     row: int,
     columns: dict,
@@ -398,6 +431,7 @@ def _build_row(
     edges = match_edges(
         table, mzs, decimals, channels, ppm=args.ppm, peak_cap=args.peak_cap
     )
+    edges, dropped = _drop_implausible(table, edges, int(mzs.shape[0]))
     keys = np.unique(edges.edge_key)
     candidate_index = np.searchsorted(keys, edges.edge_key).astype(np.int32, copy=False)
     candidate_mz = theoretical_mz(table, channels, keys)
@@ -450,6 +484,7 @@ def _build_row(
         rank,
         int(keys.size),
         candidate_index,
+        dropped,
     )
 
 
@@ -472,6 +507,7 @@ def _shard_rows(source_path: Path, args: argparse.Namespace, budget: int | None)
         "parents": set(),
         "cache_hits": 0,
         "cache_misses": 0,
+        "valence_dropped": 0,
     }
     if budget is not None and budget <= 0:
         return rows, diagnostics, totals
@@ -502,7 +538,7 @@ def _shard_rows(source_path: Path, args: argparse.Namespace, budget: int | None)
                 fail(f"{uid}: {exc}")
 
             try:
-                record, counts, mask, rank, n_candidates, edge_index = _build_row(
+                record, counts, mask, rank, n_candidates, edge_index, dropped = _build_row(
                     row, columns, subformulas, channels, mzs, intensities, decimals, args
                 )
             except EnumerationCapExceeded as exc:
@@ -516,6 +552,7 @@ def _shard_rows(source_path: Path, args: argparse.Namespace, budget: int | None)
             totals["peaks"] += int(mzs.shape[0])
             totals["candidates"] += n_candidates
             totals["edges"] += int(edge_index.size)
+            totals["valence_dropped"] += dropped
             totals["parents"].add(columns["parent_spec"][row])
 
     # Reported per shard rather than globally: each worker keeps its own cache,
@@ -587,6 +624,7 @@ def build(args: argparse.Namespace) -> int:
     )
     diagnostics = {fold: Diagnostics() for fold in BUILD_FOLDS}
     cache_stats = {"hits": 0, "misses": 0}
+    valence_dropped = 0
     fold_stats = {}
     shard_stats: dict[str, list[dict]] = {}
     started = time.perf_counter()
@@ -649,6 +687,7 @@ def build(args: argparse.Namespace) -> int:
             stats["parents"].update(totals["parents"])
             cache_stats["hits"] += totals["cache_hits"]
             cache_stats["misses"] += totals["cache_misses"]
+            valence_dropped += totals["valence_dropped"]
 
         stats["parents"] = len(stats["parents"])
         fold_stats[fold] = stats
@@ -680,6 +719,7 @@ def build(args: argparse.Namespace) -> int:
             "limit_spectra": args.limit_spectra,
             "workers": args.workers,
             "candidate_order": "ascending candidate key (ion channel, heavy mass index, hydrogen)",
+            "candidate_filter": "rdbe >= 0 and monovalent atoms <= 2(C+Si) + 2 + (N+P)",
         },
         "inputs": {
             "spectra_dir": str(spectra_dir),
@@ -750,6 +790,7 @@ def build(args: argparse.Namespace) -> int:
             "peaks_per_second": round(total_peaks / elapsed, 1) if elapsed else None,
             "subformula_cache": {"hits": cache_stats["hits"], "misses": cache_stats["misses"]},
         },
+        "candidates_dropped_by_valence_filter": valence_dropped,
         "enumeration_cap_hits": 0,
         "overflow": 0,
         "silent_truncation": 0,

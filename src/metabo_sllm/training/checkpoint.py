@@ -54,6 +54,7 @@ HEAD_MODULES = (
     "ion_head",
     "presence_head",
     "intensity_head",
+    "molecule_proj",
 )
 
 
@@ -211,7 +212,11 @@ def load_checkpoint(
 
     heads = torch.load(paths.heads, map_location=map_location, weights_only=False)
     for name in HEAD_MODULES:
-        getattr(model, name).load_state_dict(heads[name])
+        # A checkpoint written before a head existed simply lacks it; the
+        # module keeps its fresh initialisation. Prediction never routes
+        # through molecule_proj, so older checkpoints evaluate unchanged.
+        if name in heads:
+            getattr(model, name).load_state_dict(heads[name])
 
     _load_adapter(model.encoder.backbone, paths.adapter, map_location)
 

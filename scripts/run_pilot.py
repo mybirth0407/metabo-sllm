@@ -194,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
                 presence=config.loss.presence,
                 intensity=config.loss.intensity,
                 spectrum=config.loss.spectrum,
+                prefix=float(config.loss.get("prefix", 0.0)),
             ),
+            prefix_warmup_steps=int(config.training.get("prefix_warmup_steps", 0)),
+            prefix_decay_rate=float(config.training.get("prefix_decay_rate", 1.0)),
+            prefix_decay_period=int(config.training.get("prefix_decay_period", 1)),
         ),
         run_config=OmegaConf.to_container(config, resolve=True),
         supervision_root=config.data.root,
@@ -280,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"[epoch] {epoch:>2} loss={summary['total_loss']:.4f} "
                 f"bag={summary['bag_nll']:.4f} pres={summary['presence_loss']:.4f} "
                 f"int={summary['intensity_loss']:.4f} spec={summary['spectrum_loss']:.4f} "
+                f"pre={summary['prefix_loss']:.4f} "
                 f"bag_hit={summary['argmax_in_candidate_bag']:.4f} "
                 f"recall={summary['matched_presence_recall']:.4f} "
                 f"active={summary['active_slots']:.1f} lr={summary['learning_rate']:.3e} "

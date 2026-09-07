@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -51,6 +51,12 @@ class TrainingConfig:
     output_dir: str = "runs/smoke"
     seed: int = 0
     loss: LossWeights = field(default_factory=LossWeights)
+    # Schedule for the prefix term, after GLACIER: full weight for
+    # ``prefix_warmup_steps``, then multiplied by ``prefix_decay_rate`` per
+    # ``prefix_decay_period`` steps. A rate of 1.0 means no decay.
+    prefix_warmup_steps: int = 0
+    prefix_decay_rate: float = 1.0
+    prefix_decay_period: int = 1
 
 
 _AUTOCAST = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}
@@ -171,7 +177,7 @@ class Trainer:
             f"[train] step {record['step']:>5} lr={record['learning_rate']:.3e} "
             f"loss={record['total_loss']:.4f} bag={record['bag_nll']:.4f} "
             f"pres={record['presence_loss']:.4f} int={record['intensity_loss']:.4f} "
-            f"spec={record['spectrum_loss']:.4f} "
+            f"spec={record['spectrum_loss']:.4f} pre={record['prefix_loss']:.4f} "
             f"bag_hit={_fmt(record['argmax_in_candidate_bag'])} "
             f"recall={_fmt(record['matched_presence_recall'])} "
             f"active={_fmt(record['active_slots'])} "
@@ -223,6 +229,17 @@ class Trainer:
             "global_step": self.global_step,
         }
 
+    def _loss_weights(self) -> LossWeights:
+        """Loss weights at this step: the prefix term warms up, then decays."""
+        weights = self.config.loss
+        if weights.prefix == 0.0 or self.config.prefix_decay_rate == 1.0:
+            return weights
+        after = self.global_step - self.config.prefix_warmup_steps
+        if after <= 0:
+            return weights
+        ratio = self.config.prefix_decay_rate ** (after / max(1, self.config.prefix_decay_period))
+        return replace(weights, prefix=weights.prefix * ratio)
+
     def _optimizer_step(self, micro_batches: list[list[int]]) -> dict:
         started = time.perf_counter()
         self.optimizer.zero_grad(set_to_none=True)
@@ -243,6 +260,7 @@ class Trainer:
             "presence_loss": 0.0,
             "intensity_loss": 0.0,
             "spectrum_loss": 0.0,
+            "prefix_loss": 0.0,
         }
         workload = {
             "batch_spectra": 0,
@@ -269,7 +287,7 @@ class Trainer:
                 mark = time.perf_counter()
                 with self._autocast():
                     outputs, losses = training_step(
-                        self.raw_model, batch, self.config.loss
+                        self.raw_model, batch, self._loss_weights()
                     )
                 forward_time += time.perf_counter() - mark
 
@@ -284,6 +302,7 @@ class Trainer:
                 ("presence_loss", losses.presence),
                 ("intensity_loss", losses.intensity),
                 ("spectrum_loss", losses.spectrum),
+                ("prefix_loss", losses.prefix),
             ):
                 totals[key] += float(value.item()) * weight
             for key, value in batch_workload(batch).items():
@@ -363,6 +382,8 @@ class Trainer:
             "presence_loss": reduced_losses["presence_loss"],
             "intensity_loss": reduced_losses["intensity_loss"],
             "spectrum_loss": reduced_losses["spectrum_loss"],
+            "prefix_loss": reduced_losses["prefix_loss"],
+            "prefix_weight": float(self._loss_weights().prefix),
             "bag_nll": reduced_losses["identity_loss"],
             "argmax_in_candidate_bag": _ratio(
                 reduced_counters["bag_hits"], reduced_counters["bag_pairs"]
@@ -432,6 +453,7 @@ def epoch_summary(history: list[dict]) -> dict:
         "presence_loss",
         "intensity_loss",
         "spectrum_loss",
+        "prefix_loss",
         "bag_nll",
         "gradient_norm",
         "learning_rate",

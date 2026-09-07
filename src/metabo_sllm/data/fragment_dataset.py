@@ -24,7 +24,11 @@ from metabo_sllm.model.input_formatter import format_row
 
 __all__ = ["FragmentSupervisionDataset", "ROW_COLUMNS"]
 
-SCHEMA_VERSION = "fragment_supervision_v1"
+SCHEMA_VERSION = "fragment_supervision_v2"
+# v2 differs from v1 only in which candidates the bags hold -- the build
+# drops valence-implausible ones -- and the columns are identical, so both
+# versions are read.
+ACCEPTED_SCHEMA_VERSIONS = ("fragment_supervision_v1", SCHEMA_VERSION)
 MANIFEST_NAME = "manifest.json"
 
 ROW_COLUMNS = (
@@ -86,10 +90,10 @@ class FragmentSupervisionDataset:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"manifest not found: {manifest_path}")
         self.manifest = json.loads(manifest_path.read_text())
-        if self.manifest["schema_version"] != SCHEMA_VERSION:
+        if self.manifest["schema_version"] not in ACCEPTED_SCHEMA_VERSIONS:
             raise ValueError(
                 f"{manifest_path}: schema_version is {self.manifest['schema_version']!r}, "
-                f"need {SCHEMA_VERSION!r}"
+                f"need one of {ACCEPTED_SCHEMA_VERSIONS!r}"
             )
         if fold not in self.manifest["builder"]["folds"]:
             raise ValueError(f"fold {fold!r} is not present in {self.root}")

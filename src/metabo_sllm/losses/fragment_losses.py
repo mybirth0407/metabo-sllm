@@ -25,6 +25,9 @@ class LossWeights:
     presence: float = 0.2
     intensity: float = 1.0
     spectrum: float = 1.0
+    # Set-level identity over the candidate prefix tree; zero leaves the
+    # objective exactly as it was.
+    prefix: float = 0.0
 
 
 @dataclass
@@ -34,6 +37,7 @@ class LossOutput:
     presence: torch.Tensor
     intensity: torch.Tensor
     spectrum: torch.Tensor
+    prefix: torch.Tensor
     extras: dict = field(default_factory=dict)
 
 
@@ -103,6 +107,7 @@ def compute_losses(
     assignment: Assignment,
     weights: LossWeights,
     huber_delta: float = 1.0,
+    prefix_nll: torch.Tensor | None = None,
 ) -> LossOutput:
     """Identity + presence + intensity + spectrum, averaged over matched pairs.
 
@@ -132,11 +137,13 @@ def compute_losses(
         full_peak_mask,
     )
 
+    prefix = prefix_nll if prefix_nll is not None else zero
     total = (
         weights.identity * identity
         + weights.presence * presence
         + weights.intensity * intensity
         + weights.spectrum * spectrum
+        + weights.prefix * prefix
     )
     _ = (target_peak_mask, device)
     return LossOutput(
@@ -145,5 +152,6 @@ def compute_losses(
         presence=presence,
         intensity=intensity,
         spectrum=spectrum,
+        prefix=prefix,
         extras={"matched_pairs": len(assignment)},
     )
