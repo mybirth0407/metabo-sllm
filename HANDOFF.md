@@ -6,18 +6,55 @@ spectrum is rendered from those formulas. No molecular graph encoder, no MAGMa
 labels, no hard candidate selection, no full fine-tuning of the backbone, and the
 `test` fold has never been read.
 
+## 0. Read this first: two training defects, fixed in commit 876aa41
+
+Every multi-GPU run before 2026-09-07 ~10:30 UTC had two silent defects.
+**Every in-run validation number logged by those runs is a mean over four
+different models**, and every checkpoint is one of the four (rank 0's). Numbers
+in this file from those runs are labelled; the reliable number for a saved
+model is the standalone one (`scripts/evaluate_fragment_model.py`).
+
+1. **Ranks never synchronised.** `Trainer._optimizer_step` called the bare
+   module, not the `DistributedDataParallel` wrapper, so gradients were never
+   all-reduced: each rank trained on its own quarter of the data. Found by
+   noticing a checkpoint did not reproduce its own logged validation; proven by
+   splitting the in-run prediction parquet by rank (rows are gathered in rank
+   order): rank 0's quarter agreed with the checkpoint 100 %, the other three
+   0–2 %. On the V1 subset run the four ranks scored 0.350 / 0.098 / 0.345 /
+   0.210; the logged 0.2505 was their mean; **the saved rank-0 model scores
+   0.3481 on the whole fold.** Now the forward goes through the wrapper and
+   `save()` refuses to write until every rank's trainable parameters equal
+   rank 0's.
+2. **The formula decoder's linear weights never received a gradient.** The
+   two-pass scorer runs the decoder under `no_grad` (matching cost) and then
+   with gradients (matched pairs) inside one bf16 autocast context; autocast
+   caches the bf16 copy of each fp32 weight, and a copy first made under
+   `no_grad` carries no autograd history, so the gradient pass reused it.
+   LayerNorms and embeddings stay in fp32 and did train, which kept the loss
+   moving. Confirmed in isolation and pinned by `tests/test_autocast_two_pass.py`;
+   the trainer's autocast now runs with `cache_enabled=False`. DDP itself
+   caught this the moment ranks were synchronised ("parameters that were not
+   used in producing loss": every decoder linear and the count head).
+
+Consequence: every conclusion below about *formula identity being the
+bottleneck* was measured on models whose decoder body and count head sat at
+initialisation. The measurements are real; their cause was this, not the
+architecture. Re-measure on a post-fix checkpoint before redesigning anything.
+
 ## 1. Where things stand
 
-Two training runs exist, both on `scaffold_sub_10` (train 88,743 / valid 10,988
-spectra). All numbers are on the full valid fold.
+Two subset runs exist on `scaffold_sub_10` (train 88,743 / valid 10,988
+spectra), both pre-fix. In-run numbers are four-model means (see §0).
 
-| valid cos@100 | pilot V0 (ep 9) | **V1 Base (ep 27)** | change |
+| valid cos@100 | pilot V0 (ep 9) | V1 Base (ep 27), in-run mean | **V1 rank-0 checkpoint, standalone** |
 |---|---|---|---|
-| `canonical_sqrt` (primary) | 0.2182 | **0.2505** | +14.8 % |
-| `canonical_sqrt` cos@20 | 0.1976 | **0.2271** | +14.9 % |
-| `legacy_raw` (secondary) | 0.1720 | **0.2028** | +17.9 % |
-| fragment bag_hit | 0.1980 | **0.2194** | +10.8 % |
-| wall clock, 4x B200 | 0.65 h | 3.82 h | 5.9x |
+| `canonical_sqrt` (primary) | 0.2182 (standalone ≈ in-run) | 0.2505 | **0.3481** |
+| `legacy_raw` (secondary) | 0.1720 | 0.2028 | **0.2957** |
+| fragment bag_hit | 0.1980 | 0.2194 | **0.2842** |
+| wall clock, 4x B200 | 0.65 h | 3.82 h | — |
+
+The V0 pilot's four ranks happened to land close together (standalone 0.17201
+vs in-run 0.17229 in `legacy_raw`), which is why the defect went unnoticed then.
 
 **V1 has converged on this subset.** The four-epoch gain decayed 0.0160 → 0.0102
 → 0.0036 and then went negative: epoch 27 = 0.2505, epoch 30 = 0.2463, epoch 31 =
@@ -38,15 +75,20 @@ per spectrum, same as the subset), slot duplicates (lower than the subset). The
 reading: ten times the subset's steps at peak lr drove the presence head open.
 Throughput was 348 spectra/s, 58 % above the subset's.
 
-**Now running:** `bmscaffold_1/qwen_formula_slots_v1_full_warm_seed0` —
-`training.init_from` = that run's epoch-3 `checkpoints/last` (weights only;
-optimizer, schedule and sampler fresh), lr 8e-5, presence weight 0.5, seed 1,
-6 epochs, launched 2026-09-07 09:45 UTC, ~5.5 h. Predictions are now written for
-every epoch (`predictions/valid_epochNN.parquet`, presence values included), so
-presence thresholds can be swept afterwards. Success = beats 0.1364 with
-active-slot precision recovering above 0.068; if not, presence 0.5 is the first
-thing to revert. Log: `$CLAUDE_JOB_DIR/tmp/full_warm_train.txt`; stop with
-`pkill -f qwen_formula_slots_v1_full_warm`.
+A warm-start continuation of that run (`..._full_warm_seed0`, lr 8e-5, presence
+0.5) was started and then stopped once the defects were found: its "presence
+collapse" diagnosis was itself an artefact of four diverging ranks.
+
+**Now running — the first post-fix run:**
+`bmscaffold_1/qwen_formula_slots_v1_full_fixed_seed0`, config
+`configs/train/qwen_formula_slots_v1_full_fixed.yaml`. Warm-started from the
+V1 rank-0 checkpoint (0.3481; encoder adapter, slots and heads trained, decoder
+body at initialisation), lr 1.5e-4 at a real effective batch of 256, presence
+0.2, 8 epochs, launched 2026-09-07 ~10:40 UTC. Predictions are written every
+epoch (`predictions/valid_epochNN.parquet`). Its checkpoints reproduce their
+logged validation (verified on the smoke to 4 decimals). Log:
+`$CLAUDE_JOB_DIR/tmp/full_fixed_train.txt`; stop with
+`pkill -f qwen_formula_slots_v1_full_fixed`.
 
 **One experiment did not work and should not be repeated as designed.** A
 set-level identity term — SCARF's prefix-tree objective in marginal form,
@@ -231,6 +273,15 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 
 ## 8. Gotchas that have already cost time
 
+- **A checkpoint must reproduce its logged validation.** Check it on every new
+  run's first checkpoint (`evaluate_fragment_model.py` on `checkpoints/last`
+  vs the `[valid]` line). Two defects hid behind that gap for the whole
+  project (§0). `save()` now asserts rank agreement; the autocast cache is off.
+- **Under bf16 autocast, never run a module under `no_grad` before its
+  gradient pass in the same context** unless the cache is disabled — the
+  cached casts carry no history.
+- **Call the DDP wrapper, not `.module`,** for any forward whose backward must
+  synchronise.
 - **Pin BLAS threads.** On this 72-core box an unpinned thread pool made a single
   15,000-bin cosine take 221 ms instead of ~0.5 ms — a 450x penalty that would have
   turned a 2-minute audit into 43 hours. Set `OMP_NUM_THREADS=1` (and MKL /
@@ -248,9 +299,12 @@ Tests: 338 passing (`PYTHONPATH=src python3 -m pytest tests/ -q`).
 ## 9. Repository state
 
 Branch `worktree-training-pipeline-v0` (worktree at
-`.claude/worktrees/training-pipeline-v0`), thirteen commits ahead of `main`:
+`.claude/worktrees/training-pipeline-v0`), sixteen commits ahead of `main`:
 
 ```
+c3b8a4d add the first full-split config to run with the training defects fixed
+876aa41 fix two silent training defects: unsynchronised ranks, and a decoder that never learned
+a704707 record the first full-split run's collapse and the warm-start continuation
 0a68bad warm-start a run from another's weights, and keep every epoch's predictions
 0624abe record the prefix-tree result, the v2 bags, and the running full-split job
 696ac88 add the V1 full-split training config
